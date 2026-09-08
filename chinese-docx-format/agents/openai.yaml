@@ -1,0 +1,7 @@
+interface:
+  display_name: "中文 DOCX 版式控制"
+  short_description: "统一中文 Word 文档的字体与版式"
+  brand_color: "#1F4E79"
+  default_prompt: "使用 $chinese-docx-format 按中文 DOCX 版式规范撰写并检查文档。"
+policy:
+  allow_implicit_invocation: true
