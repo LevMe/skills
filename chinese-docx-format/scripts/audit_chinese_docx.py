@@ -113,27 +113,31 @@ def style_fonts(style) -> dict[str, str | None]:
     }
 
 
-def style_chain(doc, style) -> tuple[list, bool]:
-    """解析 basedOn 继承链，并报告循环继承。"""
+def style_chain(doc, style) -> tuple[list, bool, str | None]:
+    """解析 basedOn 继承链，并返回循环或悬空继承信息。"""
     chain = []
     seen: set[str] = set()
     current = style
     while current is not None:
         style_id = current.style_id
         if style_id in seen:
-            return chain, True
+            return chain, True, None
         seen.add(style_id)
         chain.append(current)
         based_on = child(style_xml(current), "basedOn")
         base_id = attribute(based_on, "val")
-        current = find_style(doc, set(), {base_id}) if base_id else None
-    return chain, False
+        if not base_id:
+            return chain, False, None
+        current = find_style(doc, set(), {base_id})
+        if current is None:
+            return chain, False, base_id
+    return chain, False, None
 
 
 def effective_style_fonts(doc, style) -> dict[str, str | None]:
     """按最近样式优先解析最终字体，避免漏检 basedOn 中的字体。"""
     result = {"eastAsia": None, "ascii": None, "hAnsi": None}
-    chain, _ = style_chain(doc, style)
+    chain, _, _ = style_chain(doc, style)
     for current in chain:
         for key, value in style_fonts(current).items():
             if result[key] is None and value:
@@ -143,7 +147,7 @@ def effective_style_fonts(doc, style) -> dict[str, str | None]:
 
 def effective_style_decoration_issues(doc, style) -> list[str]:
     """按继承链解析标题最终颜色、下划线、边框、底纹和主题字体。"""
-    chain, _ = style_chain(doc, style)
+    chain, _, _ = style_chain(doc, style)
     color = None
     underline = None
     borders = None
@@ -403,10 +407,12 @@ def check_style_inheritance(report: dict, doc) -> None:
         style = find_style(doc, {name}, {name.replace(" ", "")})
         if style is None:
             continue
-        chain, cyclic = style_chain(doc, style)
+        chain, cyclic, missing = style_chain(doc, style)
         report["style_inheritance"][name] = [item.style_id for item in chain]
         if cyclic:
             add_issue(report, "errors", "STYLE_INHERITANCE_CYCLE", f"{name} 存在循环继承", " -> ".join(item.style_id for item in chain))
+        if missing:
+            add_issue(report, "errors", "STYLE_INHERITANCE_MISSING", f"{name} 的继承样式不存在", missing)
 
 
 def numbering_level(xml_parts: dict[str, object], num_id: str | None, ilvl: str | None):
