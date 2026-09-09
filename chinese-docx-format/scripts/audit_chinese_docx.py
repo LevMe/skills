@@ -26,7 +26,10 @@ M = f"{{{M_NS}}}"
 
 CM_PER_INCH = 2.54
 EMU_PER_INCH = 914400
+TWIPS_PER_INCH = 1440
 TOLERANCE_CM = 0.04
+BASELINE_MARKER_NAME = "chinese-docx-format-base"
+BASELINE_MARKER_VALUE = "1"
 
 
 def clean(text: str | None) -> str:
@@ -46,7 +49,7 @@ def record_check(report: dict, code: str, passed: bool, message: str) -> None:
 
 
 def child(parent, tag: str):
-    return parent.find(W + tag)
+    return parent.find(W + tag) if parent is not None else None
 
 
 def attribute(element, name: str) -> str | None:
@@ -110,6 +113,77 @@ def style_fonts(style) -> dict[str, str | None]:
     }
 
 
+def style_chain(doc, style) -> tuple[list, bool]:
+    """解析 basedOn 继承链，并报告循环继承。"""
+    chain = []
+    seen: set[str] = set()
+    current = style
+    while current is not None:
+        style_id = current.style_id
+        if style_id in seen:
+            return chain, True
+        seen.add(style_id)
+        chain.append(current)
+        based_on = child(style_xml(current), "basedOn")
+        base_id = attribute(based_on, "val")
+        current = find_style(doc, set(), {base_id}) if base_id else None
+    return chain, False
+
+
+def effective_style_fonts(doc, style) -> dict[str, str | None]:
+    """按最近样式优先解析最终字体，避免漏检 basedOn 中的字体。"""
+    result = {"eastAsia": None, "ascii": None, "hAnsi": None}
+    chain, _ = style_chain(doc, style)
+    for current in chain:
+        for key, value in style_fonts(current).items():
+            if result[key] is None and value:
+                result[key] = value
+    return result
+
+
+def effective_style_decoration_issues(doc, style) -> list[str]:
+    """按继承链解析标题最终颜色、下划线、边框、底纹和主题字体。"""
+    chain, _ = style_chain(doc, style)
+    color = None
+    underline = None
+    borders = None
+    shading = None
+    theme_fonts: dict[str, str] = {}
+    for current in chain:
+        rpr = style_rpr(current)
+        if rpr is not None:
+            if color is None:
+                color = attribute(child(rpr, "color"), "val")
+            if underline is None:
+                underline = attribute(child(rpr, "u"), "val")
+            fonts = rpr.find(W + "rFonts")
+            if fonts is not None:
+                for name in ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "cstheme"):
+                    if name not in theme_fonts and attribute(fonts, name):
+                        theme_fonts[name] = attribute(fonts, name)
+        ppr = style_ppr(current)
+        if ppr is not None:
+            if borders is None:
+                borders = child(ppr, "pBdr")
+            if shading is None:
+                shading = child(ppr, "shd")
+
+    issues: list[str] = []
+    if color not in {None, "000000", "auto"}:
+        issues.append(f"颜色={color}")
+    if underline not in {None, "none"}:
+        issues.append(f"下划线={underline}")
+    if borders is not None:
+        visible = [attribute(item, "val") for item in list(borders) if attribute(item, "val") not in {None, "none"}]
+        if visible:
+            issues.append("存在段落边框")
+    if shading is not None and attribute(shading, "fill") not in {None, "auto", "FFFFFF"}:
+        issues.append(f"底纹={attribute(shading, 'fill')}")
+    if theme_fonts:
+        issues.append("存在主题字体属性")
+    return issues
+
+
 def style_size_pt(style) -> float | None:
     rpr = style_rpr(style)
     size = rpr.find(W + "sz") if rpr is not None else None
@@ -141,6 +215,13 @@ def style_indent(style) -> tuple[str | None, str | None]:
     return attribute(indent, "firstLineChars"), attribute(indent, "firstLine")
 
 
+def style_linked_character(doc, style):
+    """返回段落样式关联的字符样式。"""
+    link = child(style_xml(style), "link")
+    link_id = attribute(link, "val")
+    return find_style(doc, set(), {link_id}) if link_id else None
+
+
 def style_numpr(style) -> tuple[str | None, str | None]:
     ppr = style_ppr(style)
     numpr = ppr.find(W + "numPr") if ppr is not None else None
@@ -149,6 +230,84 @@ def style_numpr(style) -> tuple[str | None, str | None]:
     ilvl = numpr.find(W + "ilvl")
     num_id = numpr.find(W + "numId")
     return attribute(ilvl, "val"), attribute(num_id, "val")
+
+
+def paragraph_in_table(paragraph) -> bool:
+    """判断段落是否位于表格单元格中。"""
+    node = paragraph._p
+    while node is not None:
+        if node.tag == W + "tc":
+            return True
+        node = node.getparent()
+    return False
+
+
+def paragraph_has_field(paragraph, token: str | None = None) -> bool:
+    instructions = " ".join((node.text or "") for node in paragraph._p.iter(W + "instrText"))
+    if token is None:
+        return bool(instructions.strip())
+    return token.upper() in instructions.upper()
+
+
+def append_table_paragraphs(result: list, tables) -> None:
+    for table in tables:
+        for row in table.rows:
+            for cell in row.cells:
+                append_table_paragraphs(result, cell.tables)
+                for paragraph in cell.paragraphs:
+                    if paragraph not in result:
+                        result.append(paragraph)
+
+
+def all_paragraphs(doc) -> list:
+    """收集正文、表格、页眉和页脚中的段落。"""
+    result = list(doc.paragraphs)
+    append_table_paragraphs(result, doc.tables)
+    containers = []
+    for section in doc.sections:
+        containers.extend(
+            [
+                section.header,
+                section.first_page_header,
+                section.even_page_header,
+                section.footer,
+                section.first_page_footer,
+                section.even_page_footer,
+            ]
+        )
+    seen_parts: set[int] = set()
+    for container in containers:
+        part_key = id(container._element)
+        if part_key in seen_parts:
+            continue
+        seen_parts.add(part_key)
+        result.extend(container.paragraphs)
+        append_table_paragraphs(result, container.tables)
+    return result
+
+
+def all_tables(doc) -> list:
+    result: list = []
+
+    def collect(tables) -> None:
+        for table in tables:
+            result.append(table)
+            for row in table.rows:
+                for cell in row.cells:
+                    collect(cell.tables)
+
+    collect(doc.tables)
+    for section in doc.sections:
+        for container in (
+            section.header,
+            section.first_page_header,
+            section.even_page_header,
+            section.footer,
+            section.first_page_footer,
+            section.even_page_footer,
+        ):
+            collect(container.tables)
+    return result
 
 
 def check_style(
@@ -170,7 +329,7 @@ def check_style(
         add_issue(report, "errors", "STYLE_MISSING", f"缺少必需样式：{name}")
         return None
 
-    fonts = style_fonts(style)
+    fonts = effective_style_fonts(doc, style)
     if east_asia and fonts["eastAsia"] != east_asia:
         add_issue(report, "errors", "STYLE_FONT_EAST_ASIA", f"{name} 的中文字体不是 {east_asia}", str(fonts["eastAsia"]))
     if latin and fonts["ascii"] != latin and fonts["hAnsi"] != latin:
@@ -204,6 +363,103 @@ def check_style(
                 f"ilvl={ilvl}, numId={num_id}",
             )
     return style
+
+
+def check_heading_style_effects(report: dict, doc) -> None:
+    """检查标题及其关联字符样式的最终可见属性。"""
+    targets = ("Title", "Heading 1", "Heading 2", "Heading 3")
+    for name in targets:
+        style = find_style(doc, {name}, {name.replace(" ", "")})
+        if style is None:
+            continue
+        issues = effective_style_decoration_issues(doc, style)
+        linked = style_linked_character(doc, style)
+        link_id = attribute(child(style_xml(style), "link"), "val")
+        if link_id and linked is None:
+            issues.append(f"关联字符样式不存在={link_id}")
+        if linked is not None:
+            linked_issues = effective_style_decoration_issues(doc, linked)
+            if linked_issues:
+                issues.append("关联字符样式：" + ", ".join(linked_issues))
+        if issues:
+            add_issue(report, "errors", "STYLE_EFFECTIVE_DECORATION", f"{name} 样式仍含非规范视觉属性", "; ".join(issues))
+
+        ppr = style_ppr(style)
+        if name == "Heading 1" and (ppr is None or child(ppr, "pageBreakBefore") is None):
+            add_issue(report, "errors", "HEADING1_PAGE_BREAK", "Heading 1 没有设置章节起始分页")
+        if name.startswith("Heading") and (ppr is None or child(ppr, "keepNext") is None or child(ppr, "keepLines") is None):
+            add_issue(report, "warnings", "HEADING_KEEP_TOGETHER", f"{name} 未同时设置保持标题完整和与下段同页")
+
+    code = find_style(doc, {"Code Block", "CodeBlock"}, {"CodeBlock"})
+    if code is not None and style_alignment(code) != WD_ALIGN_PARAGRAPH.LEFT:
+        add_issue(report, "errors", "CODE_ALIGNMENT", "代码或技术文本样式没有左对齐")
+
+
+def check_style_inheritance(report: dict, doc) -> None:
+    """记录关键样式继承链，发现循环或悬空继承。"""
+    targets = ("Normal", "Title", "Heading 1", "Heading 2", "Heading 3")
+    report["style_inheritance"] = {}
+    for name in targets:
+        style = find_style(doc, {name}, {name.replace(" ", "")})
+        if style is None:
+            continue
+        chain, cyclic = style_chain(doc, style)
+        report["style_inheritance"][name] = [item.style_id for item in chain]
+        if cyclic:
+            add_issue(report, "errors", "STYLE_INHERITANCE_CYCLE", f"{name} 存在循环继承", " -> ".join(item.style_id for item in chain))
+
+
+def numbering_level(xml_parts: dict[str, object], num_id: str | None, ilvl: str | None):
+    if not num_id or not ilvl:
+        return None, None
+    root = xml_parts.get("word/numbering.xml")
+    if root is None:
+        return None, None
+    abstract_id = None
+    for num in root.findall(W + "num"):
+        if attribute(num, "numId") == num_id:
+            abstract_id = attribute(child(num, "abstractNumId"), "val")
+            break
+    if abstract_id is None:
+        return None, None
+    for abstract in root.findall(W + "abstractNum"):
+        if attribute(abstract, "abstractNumId") != abstract_id:
+            continue
+        for level in abstract.findall(W + "lvl"):
+            if attribute(level, "ilvl") == ilvl:
+                return abstract, level
+    return None, None
+
+
+def check_numbering_bindings(report: dict, doc, xml_parts: dict[str, object]) -> None:
+    """解析 numId 到 abstractNum，防止只看到编号属性却忽略实际编号格式。"""
+    expected = {
+        "Heading 1": ("0", "chineseCounting", "第%1章"),
+        "Heading 2": ("1", "decimal", "%1.%2"),
+        "Heading 3": ("2", "decimal", "%1.%2.%3"),
+    }
+    for name, (expected_level, expected_format, expected_text) in expected.items():
+        style = find_style(doc, {name}, {name.replace(" ", "")})
+        if style is None:
+            continue
+        actual_level, num_id = style_numpr(style)
+        abstract, level = numbering_level(xml_parts, num_id, actual_level)
+        if abstract is None or level is None:
+            add_issue(report, "errors", "NUMBERING_CHAIN", f"{name} 的编号链无法解析", f"ilvl={actual_level}, numId={num_id}")
+            continue
+        actual_format = attribute(child(level, "numFmt"), "val")
+        actual_text = attribute(child(level, "lvlText"), "val")
+        level_style = attribute(child(child(level, "pPr"), "pStyle"), "val")
+        if actual_level != expected_level or actual_format != expected_format or actual_text != expected_text:
+            add_issue(
+                report,
+                "errors",
+                "NUMBERING_DEFINITION",
+                f"{name} 的实际编号格式不符合规范",
+                f"级别={actual_level}, 格式={actual_format}, 文本={actual_text}",
+            )
+        if level_style not in {style.style_id, name.replace(" ", "")}:
+            add_issue(report, "errors", "NUMBERING_STYLE_LINK", f"{name} 的编号级别没有绑定自身样式", str(level_style))
 
 
 def load_xml(zfile: ZipFile, name: str):
@@ -243,6 +499,23 @@ def detect_profile(doc) -> tuple[str, list[str]]:
     if len(signals) >= 2:
         return "thesis", signals
     return "general", signals
+
+
+def check_baseline_marker(report: dict, xml_parts: dict[str, object], require_baseline: bool) -> None:
+    settings = xml_parts.get("word/settings.xml")
+    marker_found = False
+    if settings is not None:
+        for variable in settings.iter(W + "docVar"):
+            if attribute(variable, "name") == BASELINE_MARKER_NAME and attribute(variable, "val") == BASELINE_MARKER_VALUE:
+                marker_found = True
+                break
+    report["baseline"] = {"required": require_baseline, "verified": marker_found}
+    if marker_found:
+        record_check(report, "BASELINE_MARKER", True, "发现中文 DOCX 基线模板标识")
+    elif require_baseline:
+        add_issue(report, "errors", "BASELINE_MISSING", "没有找到本技能空白基线模板标识")
+    else:
+        add_issue(report, "warnings", "BASELINE_UNVERIFIED", "未验证文档是否来源于本技能空白基线模板")
 
 
 def check_page_and_sections(report: dict, doc, xml_parts: dict[str, object]) -> None:
@@ -351,21 +624,31 @@ def check_styles(report: dict, doc, profile: str) -> None:
         if style is not None:
             record_check(report, f"HEADING_STYLE_{level}", True, f"Heading {level} 样式存在")
 
+    check_style_inheritance(report, doc)
+    check_heading_style_effects(report, doc)
+
 
 def check_direct_formatting(report: dict, doc) -> None:
     direct_paragraphs = 0
     direct_runs = 0
+    table_direct_paragraphs = 0
     allowed_ppr = {W + "pStyle", W + "numPr"}
-    for paragraph in doc.paragraphs:
+    for paragraph in all_paragraphs(doc):
+        is_page_field = paragraph_has_field(paragraph, "PAGE")
         ppr = paragraph._p.find(W + "pPr")
-        if ppr is not None and any(child.tag not in allowed_ppr for child in ppr):
-            direct_paragraphs += 1
+        if ppr is not None:
+            disallowed = [item.tag for item in ppr if item.tag not in allowed_ppr]
+            if paragraph_in_table(paragraph) and disallowed == [W + "jc"]:
+                table_direct_paragraphs += 1
+            elif disallowed and not is_page_field:
+                direct_paragraphs += 1
         for run in paragraph.runs:
             rpr = run._r.find(W + "rPr")
-            if rpr is not None and any(child.tag != W + "rStyle" for child in rpr):
+            if rpr is not None and any(child.tag != W + "rStyle" for child in rpr) and not is_page_field:
                 direct_runs += 1
     report["direct_formatting"] = {
         "paragraphs": direct_paragraphs,
+        "table_alignment_paragraphs": table_direct_paragraphs,
         "runs": direct_runs,
     }
     if direct_paragraphs or direct_runs:
@@ -391,6 +674,11 @@ def check_headings_and_title(report: dict, doc) -> None:
             add_issue(report, "errors", "TITLE_LINES", "文档标题超过两行")
         if title is not None and style_alignment(title) != WD_ALIGN_PARAGRAPH.CENTER:
             add_issue(report, "errors", "TITLE_ALIGNMENT", "Title 样式没有居中")
+        ppr = paragraph._p.find(W + "pPr")
+        if ppr is not None:
+            borders = ppr.find(W + "pBdr")
+            if borders is not None and any(attribute(item, "val") not in {None, "none"} for item in list(borders)):
+                add_issue(report, "errors", "TITLE_DIRECT_BORDER", "文档标题段落含有直接段落边框")
 
     previous_level = 0
     seen_heading = False
@@ -422,7 +710,7 @@ def check_headings_and_title(report: dict, doc) -> None:
         previous_level = level
 
 
-def check_appendix(report: dict, doc) -> None:
+def check_appendix(report: dict, doc, xml_parts: dict[str, object]) -> None:
     appendix_paragraphs = [
         paragraph
         for paragraph in doc.paragraphs
@@ -432,14 +720,25 @@ def check_appendix(report: dict, doc) -> None:
         ilvl, num_id = style_numpr(paragraph.style)
         if ilvl != "0" or not num_id:
             add_issue(report, "errors", "APPENDIX_NUMBERING", "附录标题没有绑定独立的附录编号")
+        abstract, level = numbering_level(xml_parts, num_id, ilvl)
+        if abstract is None or level is None:
+            add_issue(report, "errors", "APPENDIX_NUMBERING_CHAIN", "附录标题的编号链无法解析")
+        else:
+            actual_text = attribute(child(level, "lvlText"), "val")
+            level_style = attribute(child(child(level, "pPr"), "pStyle"), "val")
+            if actual_text != "附录%1":
+                add_issue(report, "errors", "APPENDIX_NUMBERING_DEFINITION", "附录编号格式不是“附录%1”", str(actual_text))
+            if level_style not in {paragraph.style.style_id, "AppendixHeading"}:
+                add_issue(report, "errors", "APPENDIX_NUMBERING_STYLE_LINK", "附录编号没有绑定 Appendix Heading 样式", str(level_style))
         if re.match(r"^附录\s*[0-9A-Za-z]+", clean(paragraph.text)):
             add_issue(report, "errors", "MANUAL_APPENDIX_NUMBER", "附录标题文本包含手工编号", clean(paragraph.text))
     if appendix_paragraphs:
         record_check(report, "APPENDIX", True, f"检查 {len(appendix_paragraphs)} 个附录标题")
 
 
-def keyword_parts(text: str, label: str) -> list[str]:
-    match = re.search(rf"^{re.escape(label)}\s*[：:]\s*(.*)$", text, re.IGNORECASE)
+def keyword_parts(text: str, label: str, require_separator: bool = False) -> list[str]:
+    separator = r"\s*[：:]\s*" if require_separator else r"\s*(?:[：:]\s*)?"
+    match = re.search(rf"^{re.escape(label)}{separator}(.*)$", text, re.IGNORECASE)
     if not match:
         return []
     value = match.group(1).strip()
@@ -470,9 +769,11 @@ def check_abstracts(report: dict, doc) -> None:
             if paragraph_style_role(paragraph) != "Abstract Body":
                 add_issue(report, "errors", "ABSTRACT_STYLE", "中文摘要正文没有使用 Abstract Body 样式", clean(paragraph.text))
         if keyword_index < len(texts):
-            parts = keyword_parts(texts[keyword_index], "关键词")
+            parts = keyword_parts(texts[keyword_index], "关键词", require_separator=True)
             if not 4 <= len(parts) <= 6:
                 add_issue(report, "errors", "KEYWORD_COUNT", "中文关键词数量必须为 4 至 6 个", str(len(parts)))
+            if not re.match(r"^关键词\s*[：:]", texts[keyword_index]):
+                add_issue(report, "errors", "KEYWORD_SEPARATOR", "中文关键词标签后必须有中文冒号")
             if texts[keyword_index].rstrip().endswith(("。", "；", ";", "，", ",")):
                 add_issue(report, "errors", "KEYWORD_ENDING", "最后一个中文关键词后不得有标点")
         record_check(report, "CHINESE_ABSTRACT", True, "发现并检查中文摘要模块")
@@ -539,6 +840,54 @@ def caption_number(text: str, label: str) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2))
 
 
+def section_text_width_twips(section) -> int:
+    page_width = int(round(float(section.page_width) / EMU_PER_INCH * TWIPS_PER_INCH))
+    left = int(round(float(section.left_margin) / EMU_PER_INCH * TWIPS_PER_INCH))
+    right = int(round(float(section.right_margin) / EMU_PER_INCH * TWIPS_PER_INCH))
+    return page_width - left - right
+
+
+def table_widths(table) -> tuple[int | None, list[int]]:
+    tbl = table._tbl
+    tbl_pr = tbl.tblPr
+    width_node = tbl_pr.find(W + "tblW") if tbl_pr is not None else None
+    width = None
+    if width_node is not None and attribute(width_node, "type") in {None, "dxa"}:
+        value = attribute(width_node, "w")
+        if value and value.lstrip("-").isdigit():
+            width = int(value)
+    grid = tbl.find(W + "tblGrid")
+    grid_widths: list[int] = []
+    if grid is not None:
+        for column in grid.findall(W + "gridCol"):
+            value = attribute(column, "w")
+            if value and value.lstrip("-").isdigit():
+                grid_widths.append(int(value))
+    return width, grid_widths
+
+
+def table_border_issues(table) -> list[str]:
+    tbl_pr = table._tbl.tblPr
+    borders = tbl_pr.find(W + "tblBorders") if tbl_pr is not None else None
+    if borders is None:
+        return ["未设置明确网格边框"]
+    required = ("top", "left", "bottom", "right", "insideH", "insideV")
+    issues = []
+    for side in required:
+        node = borders.find(W + side)
+        if node is None or attribute(node, "val") in {None, "none"}:
+            issues.append(side)
+    return issues
+
+
+def first_row_repeats(table) -> bool:
+    rows = table._tbl.findall(W + "tr")
+    if not rows:
+        return False
+    tr_pr = rows[0].find(W + "trPr")
+    return tr_pr is not None and tr_pr.find(W + "tblHeader") is not None
+
+
 def check_captions_tables_images(report: dict, doc, xml_parts: dict[str, object]) -> None:
     figure_numbers: list[tuple[int, int]] = []
     table_numbers: list[tuple[int, int]] = []
@@ -586,15 +935,29 @@ def check_captions_tables_images(report: dict, doc, xml_parts: dict[str, object]
     if anchors:
         add_issue(report, "warnings", "FLOATING_IMAGE", f"发现 {anchors} 个浮动图像对象，默认应优先使用行内对象")
 
-    for table in doc.tables:
+    available_widths = [section_text_width_twips(section) for section in doc.sections]
+    available_width = min(available_widths) if available_widths else None
+    for table in all_tables(doc):
         tbl = table._tbl
         tbl_pr = tbl.tblPr
         style_node = tbl_pr.find(W + "tblStyle") if tbl_pr is not None else None
         style_value = attribute(style_node, "val")
         borders = tbl_pr.find(W + "tblBorders") if tbl_pr is not None else None
         grid_style = style_value and ("grid" in style_value.lower() or "网格" in style_value)
-        if borders is None and not grid_style:
-            add_issue(report, "errors", "TABLE_BORDERS", "表格没有明确网格边框或网格型表格样式")
+        border_issues = table_border_issues(table)
+        if border_issues and not grid_style:
+            add_issue(report, "errors", "TABLE_BORDERS", "表格没有完整的外框和内部网格边框", ", ".join(border_issues))
+        elif border_issues:
+            add_issue(report, "warnings", "TABLE_STYLE_BORDERS", "表格依赖网格样式而非完整显式边框", ", ".join(border_issues))
+
+        table_width, grid_widths = table_widths(table)
+        if available_width is not None:
+            if table_width is not None and table_width > available_width + 24:
+                add_issue(report, "errors", "TABLE_WIDTH", "表格总宽度超过版心", f"表格={table_width} twips，版心={available_width} twips")
+            if grid_widths and sum(grid_widths) > available_width + 24:
+                add_issue(report, "errors", "TABLE_GRID_WIDTH", "表格列宽总和超过版心", f"列宽总和={sum(grid_widths)} twips，版心={available_width} twips")
+        if len(tbl.findall(W + "tr")) >= 6 and not first_row_repeats(table):
+            add_issue(report, "warnings", "TABLE_HEADER_REPEAT", "长表格首行没有设置跨页重复")
         for row in tbl.findall(W + "tr"):
             tr_pr = row.find(W + "trPr")
             height = tr_pr.find(W + "trHeight") if tr_pr is not None else None
@@ -715,7 +1078,7 @@ def check_privacy(report: dict, doc) -> None:
         add_issue(report, "warnings", "DOCUMENT_METADATA", "文档仍含个人或组织元数据，交付前按需清理", str(nonempty))
 
 
-def audit(path: Path, requested_profile: str) -> dict:
+def audit(path: Path, requested_profile: str, require_baseline: bool = False) -> dict:
     report = {
         "file": str(path),
         "profile": requested_profile,
@@ -725,6 +1088,10 @@ def audit(path: Path, requested_profile: str) -> dict:
         "warnings": [],
         "direct_formatting": {},
         "images": {},
+        "visual": {
+            "status": "not_checked",
+            "message": "结构审计不包含真实页面渲染，必须另行完成 Word PDF 到 PNG 的视觉验收",
+        },
     }
     try:
         with ZipFile(path) as zfile:
@@ -753,10 +1120,12 @@ def audit(path: Path, requested_profile: str) -> dict:
         report["profile"] = requested_profile
 
     check_page_and_sections(report, doc, xml_parts)
+    check_baseline_marker(report, xml_parts, require_baseline)
     check_styles(report, doc, report["profile"])
+    check_numbering_bindings(report, doc, xml_parts)
     check_direct_formatting(report, doc)
     check_headings_and_title(report, doc)
-    check_appendix(report, doc)
+    check_appendix(report, doc, xml_parts)
     check_abstracts(report, doc)
     check_toc(report, doc, xml_parts)
     check_captions_tables_images(report, doc, xml_parts)
@@ -768,7 +1137,8 @@ def audit(path: Path, requested_profile: str) -> dict:
         "error_count": len(report["errors"]),
         "warning_count": len(report["warnings"]),
         "check_count": len(report["checks"]),
-        "result": "通过" if not report["errors"] else "发现错误",
+        "result": "结构通过" if not report["errors"] else "发现结构错误",
+        "visual_status": report["visual"]["status"],
     }
     return report
 
@@ -778,7 +1148,8 @@ def print_report(report: dict) -> None:
         "中文 DOCX 结构审计",
         f"文件：{report['file']}",
         f"模式：{report.get('profile', '未知')}（识别信号：{', '.join(report.get('detected_signals', [])) or '无'}）",
-        f"结果：{report['summary']['result']}；错误 {report['summary']['error_count']} 项，警告 {report['summary']['warning_count']} 项",
+        f"结构结果：{report['summary']['result']}；错误 {report['summary']['error_count']} 项，警告 {report['summary']['warning_count']} 项",
+        f"视觉状态：{report['visual']['status']}（{report['visual']['message']}）",
     ]
     if report["errors"]:
         lines.append("\n错误：")
@@ -797,6 +1168,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="只读审计中文 DOCX 的非内容格式")
     parser.add_argument("input", type=Path, help="待审计的 DOCX 文件")
     parser.add_argument("--profile", choices=("auto", "thesis", "general"), default="auto")
+    parser.add_argument("--require-baseline", action="store_true", help="要求文档含本技能空白基线模板标识")
     parser.add_argument("--json", dest="json_path", type=Path, help="可选的 JSON 报告路径")
     return parser.parse_args()
 
@@ -809,7 +1181,7 @@ def main() -> int:
     if not args.input.is_file():
         print(f"文件不存在：{args.input}", file=sys.stderr)
         return 2
-    report = audit(args.input.resolve(), args.profile)
+    report = audit(args.input.resolve(), args.profile, args.require_baseline)
     if args.json_path:
         args.json_path.parent.mkdir(parents=True, exist_ok=True)
         args.json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
