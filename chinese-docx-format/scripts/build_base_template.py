@@ -187,6 +187,9 @@ def set_style_paragraph(
         indent.set(tag("firstLine"), str(first_line_twips))
     if hanging_twips is not None:
         indent.set(tag("hanging"), str(hanging_twips))
+    elif first_line_chars is None and first_line_twips is None:
+        # 非正文样式显式清零首行缩进，避免从 Normal 继承两个字符。
+        indent.set(tag("firstLine"), "0")
     ppr.append(indent)
 
     if keep_next:
@@ -291,6 +294,11 @@ def add_numbering(document: Document, *, reset: bool = False) -> tuple[int, int]
         justify.set(tag("val"), alignment)
         item.append(justify)
         ppr = OxmlElement("w:pPr")
+        list_indent = OxmlElement("w:ind")
+        list_indent.set(tag("left"), "0")
+        list_indent.set(tag("hanging"), "0")
+        list_indent.set(tag("firstLine"), "0")
+        ppr.append(list_indent)
         pstyle = OxmlElement("w:pStyle")
         pstyle.set(tag("val"), style_id)
         ppr.append(pstyle)
@@ -313,7 +321,7 @@ def add_numbering(document: Document, *, reset: bool = False) -> tuple[int, int]
     multi.set(tag("val"), "multilevel")
     main.append(multi)
     add_level(main, 0, "chineseCounting", "第%1章", "Heading1", "center")
-    add_level(main, 1, "decimal", "%1.%2", "Heading2", "center", legal=True)
+    add_level(main, 1, "decimal", "%1.%2", "Heading2", "left", legal=True)
     add_level(main, 2, "decimal", "%1.%2.%3", "Heading3", "left", legal=True)
 
     appendix = OxmlElement("w:abstractNum")
@@ -365,19 +373,19 @@ def configure_styles(document: Document, *, reset_numbering: bool = False) -> No
 
     title = document.styles["Title"]
     set_style_meta(title, based_on=normal_id, next_style=normal_id)
-    set_style_fonts(title, "黑体", "Times New Roman", 16, bold=True)
+    set_style_fonts(title, "黑体", "Times New Roman", 16, bold=False)
     set_style_paragraph(title, alignment=WD_ALIGN_PARAGRAPH.CENTER, line_twips=360, keep_next=True, keep_lines=True)
-    set_linked_character_style(document, title, "Title Char", "黑体", "Times New Roman", 16, True)
+    set_linked_character_style(document, title, "Title Char", "黑体", "Times New Roman", 16, False)
 
     heading_specs = (
         ("Heading 1", 16, WD_ALIGN_PARAGRAPH.CENTER, 0, 480, True),
-        ("Heading 2", 14, WD_ALIGN_PARAGRAPH.CENTER, 1, 240, False),
+        ("Heading 2", 14, WD_ALIGN_PARAGRAPH.LEFT, 1, 240, False),
         ("Heading 3", 12, WD_ALIGN_PARAGRAPH.LEFT, 2, 120, False),
     )
     for name, size, alignment, outline, after, page_break in heading_specs:
         style = document.styles[name]
         set_style_meta(style, based_on=normal_id, next_style=normal_id)
-        set_style_fonts(style, "黑体", "Times New Roman", size, bold=True)
+        set_style_fonts(style, "黑体", "Times New Roman", size, bold=False)
         set_style_paragraph(
             style,
             alignment=alignment,
@@ -388,7 +396,7 @@ def configure_styles(document: Document, *, reset_numbering: bool = False) -> No
             page_break_before=page_break,
             outline_level=outline,
         )
-        set_linked_character_style(document, style, name + " Char", "黑体", "Times New Roman", size, True)
+        set_linked_character_style(document, style, name + " Char", "黑体", "Times New Roman", size, False)
 
     figure = get_or_add_style(document, "Figure Caption", WD_STYLE_TYPE.PARAGRAPH)
     set_style_meta(figure, based_on=normal_id, next_style=normal_id)
@@ -426,7 +434,7 @@ def configure_styles(document: Document, *, reset_numbering: bool = False) -> No
     for name in ("Abstract Heading", "English Abstract Heading", "TOC Title"):
         style = get_or_add_style(document, name, WD_STYLE_TYPE.PARAGRAPH)
         set_style_meta(style, based_on=normal_id, next_style=normal_id)
-        set_style_fonts(style, "黑体", "Times New Roman", 16, bold=True)
+        set_style_fonts(style, "黑体", "Times New Roman", 16, bold=False)
         set_style_paragraph(style, alignment=WD_ALIGN_PARAGRAPH.CENTER, line_twips=360, keep_next=True, keep_lines=True)
 
     for level in range(1, 4):
@@ -437,7 +445,7 @@ def configure_styles(document: Document, *, reset_numbering: bool = False) -> No
 
     appendix = get_or_add_style(document, "Appendix Heading", WD_STYLE_TYPE.PARAGRAPH)
     set_style_meta(appendix, based_on=normal_id, next_style=normal_id)
-    set_style_fonts(appendix, "黑体", "Times New Roman", 16, bold=True)
+    set_style_fonts(appendix, "黑体", "Times New Roman", 16, bold=False)
     set_style_paragraph(appendix, alignment=WD_ALIGN_PARAGRAPH.CENTER, line_twips=360, keep_next=True, keep_lines=True, page_break_before=True)
 
     code = get_or_add_style(document, "Code Block", WD_STYLE_TYPE.PARAGRAPH)
@@ -451,7 +459,7 @@ def configure_styles(document: Document, *, reset_numbering: bool = False) -> No
     set_style_paragraph(table_text, alignment=WD_ALIGN_PARAGRAPH.LEFT, line_twips=300)
 
     for name, east_asia, size, bold in (
-        ("Keyword Label", "黑体", 14, True),
+        ("Keyword Label", "黑体", 14, False),
         ("Keyword Content", "宋体", 14, False),
     ):
         character = get_or_add_style(document, name, WD_STYLE_TYPE.CHARACTER)

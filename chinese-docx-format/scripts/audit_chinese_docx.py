@@ -219,6 +219,39 @@ def style_indent(style) -> tuple[str | None, str | None]:
     return attribute(indent, "firstLineChars"), attribute(indent, "firstLine")
 
 
+def effective_style_indent(doc, style) -> dict[str, str | None]:
+    """按继承链解析段落缩进，避免标题继承 Normal 的首行缩进。"""
+    result = {name: None for name in ("left", "right", "firstLine", "firstLineChars", "hanging")}
+    first_line_seen = False
+    chain, _, _ = style_chain(doc, style)
+    for current in chain:
+        ppr = style_ppr(current)
+        indent = ppr.find(W + "ind") if ppr is not None else None
+        if indent is None:
+            continue
+        for name in ("left", "right"):
+            if result[name] is None:
+                result[name] = attribute(indent, name)
+        if first_line_seen:
+            continue
+        for name in ("firstLine", "firstLineChars", "hanging"):
+            value = attribute(indent, name)
+            if value is not None:
+                result[name] = value
+                first_line_seen = True
+                break
+    return result
+
+
+def effective_style_has_tabs(doc, style) -> bool:
+    """检查标题样式继承链中是否残留制表位定义。"""
+    chain, _, _ = style_chain(doc, style)
+    return any(
+        style_ppr(current) is not None and style_ppr(current).find(W + "tabs") is not None
+        for current in chain
+    )
+
+
 def style_boolean(doc, style, name: str) -> bool:
     """按继承链解析开关属性，显式 false 也必须覆盖父样式。"""
     chain, _, _ = style_chain(doc, style)
@@ -394,7 +427,16 @@ def check_style(
 
 def check_heading_style_effects(report: dict, doc) -> None:
     """检查标题及其关联字符样式的最终可见属性。"""
-    targets = ("Title", "Heading 1", "Heading 2", "Heading 3")
+    targets = (
+        "Title",
+        "Heading 1",
+        "Heading 2",
+        "Heading 3",
+        "Abstract Heading",
+        "English Abstract Heading",
+        "TOC Title",
+        "Appendix Heading",
+    )
     for name in targets:
         style = find_style(doc, {name}, {name.replace(" ", "")})
         if style is None:
@@ -406,15 +448,28 @@ def check_heading_style_effects(report: dict, doc) -> None:
             issues.append(f"关联字符样式不存在={link_id}")
         if linked is not None:
             linked_issues = effective_style_decoration_issues(doc, linked)
+            if style_run_boolean(doc, linked, "b"):
+                linked_issues.append("关联字符样式：不应加粗")
             if linked_issues:
                 issues.append("关联字符样式：" + ", ".join(linked_issues))
         if issues:
             add_issue(report, "errors", "STYLE_EFFECTIVE_DECORATION", f"{name} 样式仍含非规范视觉属性", "; ".join(issues))
 
-        if not style_run_boolean(doc, style, "b"):
-            add_issue(report, "errors", "STYLE_BOLD", f"{name} 没有设置黑体所需的加粗属性")
+        if style_run_boolean(doc, style, "b"):
+            add_issue(report, "errors", "STYLE_BOLD", f"{name} 不应设置加粗属性")
         if style_run_boolean(doc, style, "i"):
             add_issue(report, "errors", "STYLE_ITALIC", f"{name} 不应继承倾斜属性")
+
+        indent = effective_style_indent(doc, style)
+        nonzero_indent = [
+            f"{name}={value}"
+            for name, value in indent.items()
+            if value not in {None, "0"}
+        ]
+        if nonzero_indent:
+            add_issue(report, "errors", "HEADING_INDENT", f"{name} 不应有首行或左侧缩进", ", ".join(nonzero_indent))
+        if effective_style_has_tabs(doc, style):
+            add_issue(report, "errors", "HEADING_TABS", f"{name} 不应包含制表位定义")
 
         ppr = style_ppr(style)
         if name == "Heading 1" and (ppr is None or child(ppr, "pageBreakBefore") is None):
@@ -491,11 +546,11 @@ def numbering_level(xml_parts: dict[str, object], num_id: str | None, ilvl: str 
 def check_numbering_bindings(report: dict, doc, xml_parts: dict[str, object]) -> None:
     """解析 numId 到 abstractNum，防止只看到编号属性却忽略实际编号格式。"""
     expected = {
-        "Heading 1": ("0", "chineseCounting", "第%1章", False),
-        "Heading 2": ("1", "decimal", "%1.%2", True),
-        "Heading 3": ("2", "decimal", "%1.%2.%3", True),
+        "Heading 1": ("0", "chineseCounting", "第%1章", False, "center"),
+        "Heading 2": ("1", "decimal", "%1.%2", True, "left"),
+        "Heading 3": ("2", "decimal", "%1.%2.%3", True, "left"),
     }
-    for name, (expected_level, expected_format, expected_text, expected_legal) in expected.items():
+    for name, (expected_level, expected_format, expected_text, expected_legal, expected_alignment) in expected.items():
         style = find_style(doc, {name}, {name.replace(" ", "")})
         if style is None:
             continue
@@ -506,6 +561,7 @@ def check_numbering_bindings(report: dict, doc, xml_parts: dict[str, object]) ->
             continue
         actual_format = attribute(child(level, "numFmt"), "val")
         actual_text = attribute(child(level, "lvlText"), "val")
+        actual_alignment = attribute(child(level, "lvlJc"), "val")
         level_style = attribute(child(child(level, "pPr"), "pStyle"), "val")
         actual_legal = child(level, "isLgl") is not None
         if actual_level != expected_level or actual_format != expected_format or actual_text != expected_text:
@@ -515,6 +571,27 @@ def check_numbering_bindings(report: dict, doc, xml_parts: dict[str, object]) ->
                 "NUMBERING_DEFINITION",
                 f"{name} 的实际编号格式不符合规范",
                 f"级别={actual_level}, 格式={actual_format}, 文本={actual_text}",
+            )
+        if actual_alignment != expected_alignment:
+            add_issue(
+                report,
+                "errors",
+                "NUMBERING_ALIGNMENT",
+                f"{name} 的编号级别没有左/中对齐到规范位置",
+                f"实际={actual_alignment}，期望={expected_alignment}",
+            )
+        indent = child(child(level, "pPr"), "ind")
+        actual_indent = {
+            name: attribute(indent, name)
+            for name in ("left", "hanging", "firstLine")
+        }
+        if any(value != "0" for value in actual_indent.values()):
+            add_issue(
+                report,
+                "errors",
+                "NUMBERING_INDENT",
+                f"{name} 的编号级别含有隐式缩进或制表位前置空间",
+                str(actual_indent),
             )
         if actual_legal != expected_legal:
             add_issue(
@@ -659,7 +736,7 @@ def check_styles(report: dict, doc, profile: str) -> None:
         ("Normal", {"Normal"}, "宋体", "Times New Roman", 12, WD_ALIGN_PARAGRAPH.JUSTIFY, "360", "200", None),
         ("Title", {"Title"}, "黑体", "Times New Roman", 16, WD_ALIGN_PARAGRAPH.CENTER, "360", None, None),
         ("Heading 1", {"Heading1"}, "黑体", "Times New Roman", 16, WD_ALIGN_PARAGRAPH.CENTER, None, None, "0"),
-        ("Heading 2", {"Heading2"}, "黑体", "Times New Roman", 14, WD_ALIGN_PARAGRAPH.CENTER, None, None, "1"),
+        ("Heading 2", {"Heading2"}, "黑体", "Times New Roman", 14, WD_ALIGN_PARAGRAPH.LEFT, None, None, "1"),
         ("Heading 3", {"Heading3"}, "黑体", "Times New Roman", 12, WD_ALIGN_PARAGRAPH.LEFT, None, None, "2"),
         ("Figure Caption", {"Figure Caption"}, "楷体", "Times New Roman", 10.5, WD_ALIGN_PARAGRAPH.CENTER, "300", None, None),
         ("Table Caption", {"Table Caption"}, "楷体", "Times New Roman", 10.5, WD_ALIGN_PARAGRAPH.CENTER, "300", None, None),
