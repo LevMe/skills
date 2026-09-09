@@ -8,17 +8,20 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import re
 from pathlib import Path
 
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.opc.part import Part
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 from build_base_template import (
     add_baseline_marker,
+    clear_container,
     configure_document,
     configure_styles,
     find,
@@ -28,6 +31,8 @@ from build_base_template import (
 
 
 M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+BASE_TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "assets" / "chinese-docx-base-template.docx"
 
 
 def clean(text: str | None) -> str:
@@ -53,13 +58,23 @@ def has_omml(paragraph) -> bool:
 
 
 def is_toc_entry(paragraph) -> bool:
-    """目录缓存通常由超链接组成，不能当作正文标题重新编号。"""
-    return any(node.tag == tag("hyperlink") for node in paragraph._p.iter())
+    """只识别目录样式或带页码制表位的目录项，避免误伤引用超链接。"""
+    style = style_text(paragraph)
+    if any(marker in style for marker in ("toc", "table of figures", "table of tables", "目录")):
+        return True
+    return any(node.tag == tag("hyperlink") for node in paragraph._p.iter()) and any(
+        node.tag == tag("tab") for node in paragraph._p.iter()
+    )
 
 
 def toc_role(paragraph) -> str | None:
     if not is_toc_entry(paragraph):
         return None
+    style = style_text(paragraph)
+    if "table of figures" in style:
+        return "Figure List"
+    if "table of tables" in style:
+        return "Table List"
     text = clean(paragraph.text)
     if re.match(r"^\d+\.\d+\.\d+", text):
         return "TOC 3"
@@ -89,6 +104,144 @@ def all_paragraphs(document: Document) -> list:
             seen.add(key)
             unique.append(paragraph)
     return unique
+
+
+def detect_profile(document: Document) -> str:
+    """按论文结构信号选择模式，不依赖源文档的旧样式名称。"""
+    texts = [clean(paragraph.text) for paragraph in all_paragraphs(document)]
+    joined = "\n".join(texts)
+    signals = (
+        bool(re.search(r"(?:摘\s*要|摘要)", joined)),
+        "ABSTRACT" in joined.upper(),
+        bool(re.search(r"(?:目\s*录|目录)", joined)),
+        "参考文献" in joined,
+        any(re.match(r"^第[一二三四五六七八九十百千万零〇]+章", text) for text in texts),
+    )
+    return "thesis" if sum(signals) >= 2 else "general"
+
+
+def clear_main_body(document: Document) -> None:
+    """清空基线模板正文，同时保留唯一节属性。"""
+    body = document._body._element
+    for child in list(body):
+        if child.tag != tag("sectPr"):
+            body.remove(child)
+
+
+def source_body_content(source: Document) -> list:
+    """复制正文和表格节点，不复制源文档的节属性。"""
+    content = []
+    for child in list(source._body._element):
+        if child.tag == tag("sectPr"):
+            continue
+        node = copy.deepcopy(child)
+        for sect_pr in list(node.iter(tag("sectPr"))):
+            parent = sect_pr.getparent()
+            if parent is not None:
+                parent.remove(sect_pr)
+        content.append(node)
+    return content
+
+
+def relationship_ids(root) -> set[str]:
+    return {
+        value
+        for node in root.iter()
+        for name, value in node.attrib.items()
+        if name.startswith("{" + REL_NS + "}")
+    }
+
+
+def clone_related_part(source_part, target_package, cache: dict):
+    """将正文引用的媒体或嵌入对象复制到目标包。"""
+    key = str(source_part.partname)
+    if key in cache:
+        return cache[key]
+
+    existing = next(
+        (part for part in target_package.iter_parts() if str(part.partname) == key),
+        None,
+    )
+    if existing is not None:
+        cache[key] = existing
+        return existing
+
+    cloned = Part(
+        source_part.partname,
+        source_part.content_type,
+        source_part.blob,
+        target_package,
+    )
+    cache[key] = cloned
+    return cloned
+
+
+def copy_source_relationships(source: Document, target: Document, content: list) -> dict[str, str]:
+    """复制正文所需关系，并返回源 rId 到目标 rId 的映射。"""
+    wrapper = OxmlElement("w:body")
+    for node in content:
+        wrapper.append(copy.deepcopy(node))
+    needed = relationship_ids(wrapper)
+    source_body = source._body._element
+    has_footnotes = any(node.tag == tag("footnoteReference") for node in source_body.iter())
+    has_endnotes = any(node.tag == tag("endnoteReference") for node in source_body.iter())
+    for rel_id, relation in source.part.rels.items():
+        if has_footnotes and relation.reltype.endswith("/footnotes"):
+            needed.add(rel_id)
+        if has_endnotes and relation.reltype.endswith("/endnotes"):
+            needed.add(rel_id)
+
+    target_part = target.part
+    target_package = target.part.package
+    part_cache = {}
+    mapping = {}
+    for rel_id in sorted(needed):
+        relation = source.part.rels.get(rel_id)
+        if relation is None:
+            continue
+        if relation.is_external:
+            new_id = target_part.relate_to(
+                relation.target_ref,
+                relation.reltype,
+                is_external=True,
+            )
+        else:
+            cloned = clone_related_part(relation.target_part, target_package, part_cache)
+            new_id = target_part.relate_to(cloned, relation.reltype)
+        mapping[rel_id] = new_id
+    return mapping
+
+
+def remap_relationship_ids(root, mapping: dict[str, str]) -> None:
+    for node in root.iter():
+        for name, value in list(node.attrib.items()):
+            if name.startswith("{" + REL_NS + "}") and value in mapping:
+                node.set(name, mapping[value])
+
+
+def first_nonempty_header_text(document: Document, attribute: str) -> str:
+    for section in document.sections:
+        container = getattr(section, attribute)
+        value = clean(" ".join(paragraph.text for paragraph in container.paragraphs))
+        if value:
+            return value
+    return ""
+
+
+def set_header_text(container, text: str, style_id: str) -> None:
+    if not text:
+        return
+    clear_container(container, style_id)
+    container.paragraphs[0].text = text
+
+
+def copy_thesis_headers(source: Document, target: Document) -> None:
+    """论文模式保留源文档已有页眉文字，但不虚构学校或学位信息。"""
+    section = target.sections[0]
+    header_id = target.styles["Header"].style_id
+    set_header_text(section.header, first_nonempty_header_text(source, "header"), header_id)
+    set_header_text(section.even_page_header, first_nonempty_header_text(source, "even_page_header"), header_id)
+    set_header_text(section.first_page_header, first_nonempty_header_text(source, "first_page_header"), header_id)
 
 
 def looks_like_heading(text: str) -> int | None:
@@ -159,7 +312,8 @@ def classify(paragraph, is_first_nonempty: bool) -> str:
         return "Abstract Heading"
     if text == "ABSTRACT":
         return "English Abstract Heading"
-    if text in {"目录", "目 录"}:
+    compact = re.sub(r"\s+", "", text)
+    if compact in {"目录", "图目录", "表目录", "插图目录", "插表目录"}:
         return "TOC Title"
     if text == "参考文献":
         return "Heading 1"
@@ -186,20 +340,88 @@ def classify(paragraph, is_first_nonempty: bool) -> str:
     return "Normal"
 
 
+def is_front_matter_metadata(text: str) -> bool:
+    """跳过论文封面上的编号、分类和日期字段，避免把它们当作文档标题。"""
+    if not text or len(text) > 80:
+        return False
+    compact = re.sub(r"\s+", "", text).upper()
+    markers = (
+        "学校代码",
+        "学号",
+        "分类号",
+        "密级",
+        "UDC",
+        "论文题目",
+        "学位论文",
+        "申请学位",
+        "专业",
+        "学科",
+        "作者",
+        "指导教师",
+        "答辩日期",
+        "提交日期",
+    )
+    return any(marker.upper() in compact for marker in markers)
+
+
+def find_title_index(paragraphs: list, profile: str) -> int | None:
+    for index, paragraph in enumerate(paragraphs):
+        text = clean(paragraph.text)
+        if not text:
+            continue
+        if "title" in style_text(paragraph):
+            return index
+        if profile == "thesis" and is_front_matter_metadata(text):
+            continue
+        return index
+    return None
+
+
+def classify_paragraphs(paragraphs: list, profile: str) -> list[tuple[object, str]]:
+    """按段落上下文识别摘要正文，同时保留源段落的顺序。"""
+    title_index = find_title_index(paragraphs, profile)
+    module: str | None = None
+    roles = []
+    for index, paragraph in enumerate(paragraphs):
+        text = clean(paragraph.text)
+        compact = re.sub(r"\s+", "", text)
+        role = classify(paragraph, index == title_index)
+        if compact in {"摘要"}:
+            module = "abstract"
+            role = "Abstract Heading"
+        elif compact == "ABSTRACT":
+            module = "english"
+            role = "English Abstract Heading"
+        elif compact.startswith("关键词"):
+            module = None
+        elif compact.startswith("KEYWORDS"):
+            module = None
+        elif module == "abstract" and text and role == "Normal" and not in_table(paragraph):
+            role = "Abstract Body"
+        elif module == "english" and text and role == "Normal" and not in_table(paragraph):
+            role = "English Abstract Body"
+        roles.append((paragraph, role))
+    return roles
+
+
 def strip_heading_prefix(paragraph, role: str) -> None:
     if role not in {"Heading 1", "Heading 2", "Heading 3", "Appendix Heading"}:
         return
-    text = clean(paragraph.text)
+    text = paragraph.text or ""
     patterns = {
         "Heading 1": r"^\s*(?:第[一二三四五六七八九十百千万零〇]+章|[一二三四五六七八九十百千万零〇]+[、.．]|\d+\.)\s*",
         "Heading 2": r"^\s*\d+\.\d+\s*",
         "Heading 3": r"^\s*\d+\.\d+\.\d+\s*",
         "Appendix Heading": r"^\s*附录\s*[0-9A-Za-z]+\s*",
     }
-    match = re.match(patterns[role], text)
-    if not match or not paragraph.runs:
+    leading = re.match(r"^[ \t\u00a0]+", text)
+    leading_text = leading.group(0) if leading else ""
+    remainder = text[len(leading_text):]
+    match = re.match(patterns[role], remainder)
+    prefix = leading_text + (match.group(0) if match else "")
+    if not prefix or not paragraph.runs:
         return
-    remaining = len(match.group(0))
+    remaining = len(prefix)
     for run in paragraph.runs:
         if remaining <= 0:
             break
@@ -394,20 +616,33 @@ def scale_inline_images(document: Document) -> None:
 def format_document(input_path: Path, output_path: Path, profile: str) -> None:
     if input_path.resolve() == output_path.resolve():
         raise ValueError("输出文件必须与输入文件不同，原文档不会被覆盖")
-    document = Document(str(input_path))
-    original_paragraphs = all_paragraphs(document)
-    first_nonempty = True
-    roles = []
-    for paragraph in original_paragraphs:
-        role = classify(paragraph, first_nonempty)
-        if clean(paragraph.text):
-            first_nonempty = False
-        roles.append((paragraph, role))
+    source = Document(str(input_path))
+    resolved_profile = detect_profile(source) if profile == "auto" else profile
+    original_paragraphs = all_paragraphs(source)
+    roles = classify_paragraphs(original_paragraphs, resolved_profile)
 
-    configure_styles(document, reset_numbering=False)
-    configure_document(document)
+    if not BASE_TEMPLATE_PATH.is_file():
+        raise FileNotFoundError(f"找不到空白基线模板：{BASE_TEMPLATE_PATH}")
+    document = Document(str(BASE_TEMPLATE_PATH))
+    clear_main_body(document)
+    configure_styles(document, reset_numbering=True)
+    configure_document(document, resolved_profile)
 
-    for paragraph, role in roles:
+    content = source_body_content(source)
+    target_body = document._body._element
+    for node in content:
+        target_body.insert(len(target_body) - 1, node)
+    relationship_map = copy_source_relationships(source, document, content)
+    for node in content:
+        remap_relationship_ids(node, relationship_map)
+
+    target_paragraphs = all_paragraphs(document)
+    if len(target_paragraphs) != len(roles):
+        raise ValueError(
+            f"迁移后段落数量不一致：源文档 {len(roles)}，目标文档 {len(target_paragraphs)}"
+        )
+
+    for paragraph, (_, role) in zip(target_paragraphs, roles):
         if role not in {style.name for style in document.styles}:
             role = "Normal"
         strip_heading_prefix(paragraph, role)
@@ -415,6 +650,8 @@ def format_document(input_path: Path, output_path: Path, profile: str) -> None:
         clean_paragraph_properties(paragraph, role, style.style_id)
         clean_run_properties(paragraph)
 
+    if resolved_profile == "thesis":
+        copy_thesis_headers(source, document)
     format_tables(document)
     scale_inline_images(document)
     add_baseline_marker(document)

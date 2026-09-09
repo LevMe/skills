@@ -2,6 +2,6 @@ interface:
   display_name: "中文 DOCX 版式控制"
   short_description: "统一中文 Word 文档样式并完成版式验收"
   brand_color: "#1F4E79"
-  default_prompt: "使用 $chinese-docx-format 按中文 DOCX 版式规范迁移文档，只调整非内容格式；标题使用不加粗黑体，一级居中、二级和三级左对齐；优先使用迁移脚本，并完成结构审计和 Word 视觉验收。"
+  default_prompt: "使用 $chinese-docx-format 按中文 DOCX 版式规范迁移文档，只调整非内容格式；标题使用不加粗黑体，一级居中、二级和三级左对齐，标题缩进与制表位清零；一级标题 1.5 倍行距且段后 1 行，其余标题 1.5 倍行距；优先使用迁移脚本，并完成结构审计和 Word 视觉验收。"
 policy:
   allow_implicit_invocation: true

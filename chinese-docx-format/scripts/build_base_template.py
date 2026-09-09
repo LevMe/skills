@@ -140,8 +140,9 @@ def set_style_paragraph(
     *,
     alignment: int,
     line_twips: int,
-    before_twips: int = 0,
-    after_twips: int = 0,
+    before_twips: int | None = 0,
+    after_twips: int | None = 0,
+    after_lines: int | None = None,
     first_line_chars: int | None = None,
     first_line_twips: int | None = None,
     hanging_twips: int | None = None,
@@ -172,8 +173,12 @@ def set_style_paragraph(
     ppr.append(jc)
 
     spacing = OxmlElement("w:spacing")
-    spacing.set(tag("before"), str(before_twips))
-    spacing.set(tag("after"), str(after_twips))
+    if before_twips is not None:
+        spacing.set(tag("before"), str(before_twips))
+    if after_twips is not None:
+        spacing.set(tag("after"), str(after_twips))
+    if after_lines is not None:
+        spacing.set(tag("afterLines"), str(after_lines))
     spacing.set(tag("line"), str(line_twips))
     spacing.set(tag("lineRule"), "auto")
     ppr.append(spacing)
@@ -371,6 +376,11 @@ def configure_styles(document: Document, *, reset_numbering: bool = False) -> No
     set_style_fonts(footer, "宋体", "Times New Roman", 10.5)
     set_style_paragraph(footer, alignment=WD_ALIGN_PARAGRAPH.CENTER, line_twips=240)
 
+    header = document.styles["Header"]
+    set_style_meta(header, based_on=normal_id, next_style=normal_id)
+    set_style_fonts(header, "宋体", "Times New Roman", 10.5)
+    set_style_paragraph(header, alignment=WD_ALIGN_PARAGRAPH.CENTER, line_twips=240)
+
     title = document.styles["Title"]
     set_style_meta(title, based_on=normal_id, next_style=normal_id)
     set_style_fonts(title, "黑体", "Times New Roman", 16, bold=False)
@@ -378,11 +388,11 @@ def configure_styles(document: Document, *, reset_numbering: bool = False) -> No
     set_linked_character_style(document, title, "Title Char", "黑体", "Times New Roman", 16, False)
 
     heading_specs = (
-        ("Heading 1", 16, WD_ALIGN_PARAGRAPH.CENTER, 0, 480, True),
-        ("Heading 2", 14, WD_ALIGN_PARAGRAPH.LEFT, 1, 240, False),
-        ("Heading 3", 12, WD_ALIGN_PARAGRAPH.LEFT, 2, 120, False),
+        ("Heading 1", 16, WD_ALIGN_PARAGRAPH.CENTER, 0, 100, True),
+        ("Heading 2", 14, WD_ALIGN_PARAGRAPH.LEFT, 1, None, False),
+        ("Heading 3", 12, WD_ALIGN_PARAGRAPH.LEFT, 2, None, False),
     )
-    for name, size, alignment, outline, after, page_break in heading_specs:
+    for name, size, alignment, outline, after_lines, page_break in heading_specs:
         style = document.styles[name]
         set_style_meta(style, based_on=normal_id, next_style=normal_id)
         set_style_fonts(style, "黑体", "Times New Roman", size, bold=False)
@@ -390,7 +400,8 @@ def configure_styles(document: Document, *, reset_numbering: bool = False) -> No
             style,
             alignment=alignment,
             line_twips=360,
-            after_twips=after,
+            after_twips=None if after_lines is not None else 0,
+            after_lines=after_lines,
             keep_next=True,
             keep_lines=True,
             page_break_before=page_break,
@@ -401,12 +412,12 @@ def configure_styles(document: Document, *, reset_numbering: bool = False) -> No
     figure = get_or_add_style(document, "Figure Caption", WD_STYLE_TYPE.PARAGRAPH)
     set_style_meta(figure, based_on=normal_id, next_style=normal_id)
     set_style_fonts(figure, "楷体", "Times New Roman", 10.5)
-    set_style_paragraph(figure, alignment=WD_ALIGN_PARAGRAPH.CENTER, line_twips=300, after_twips=120, keep_next=True, keep_lines=True)
+    set_style_paragraph(figure, alignment=WD_ALIGN_PARAGRAPH.CENTER, line_twips=300, keep_next=True, keep_lines=True)
 
     table_caption = get_or_add_style(document, "Table Caption", WD_STYLE_TYPE.PARAGRAPH)
     set_style_meta(table_caption, based_on=normal_id, next_style=normal_id)
     set_style_fonts(table_caption, "楷体", "Times New Roman", 10.5)
-    set_style_paragraph(table_caption, alignment=WD_ALIGN_PARAGRAPH.CENTER, line_twips=300, after_twips=120, keep_next=True, keep_lines=True)
+    set_style_paragraph(table_caption, alignment=WD_ALIGN_PARAGRAPH.CENTER, line_twips=300, keep_next=True, keep_lines=True)
 
     equation = get_or_add_style(document, "Equation", WD_STYLE_TYPE.PARAGRAPH)
     set_style_meta(equation, based_on=normal_id, next_style=normal_id)
@@ -441,7 +452,13 @@ def configure_styles(document: Document, *, reset_numbering: bool = False) -> No
         style = get_or_add_style(document, f"TOC {level}", WD_STYLE_TYPE.PARAGRAPH)
         set_style_meta(style, based_on=normal_id, next_style=normal_id)
         set_style_fonts(style, "宋体", "Times New Roman", 12)
-        set_style_paragraph(style, alignment=WD_ALIGN_PARAGRAPH.LEFT, line_twips=360)
+        set_style_paragraph(style, alignment=WD_ALIGN_PARAGRAPH.LEFT, line_twips=300)
+
+    for name in ("Figure List", "Table List"):
+        style = get_or_add_style(document, name, WD_STYLE_TYPE.PARAGRAPH)
+        set_style_meta(style, based_on=normal_id, next_style=normal_id)
+        set_style_fonts(style, "楷体", "Times New Roman", 10.5)
+        set_style_paragraph(style, alignment=WD_ALIGN_PARAGRAPH.LEFT, line_twips=300)
 
     appendix = get_or_add_style(document, "Appendix Heading", WD_STYLE_TYPE.PARAGRAPH)
     set_style_meta(appendix, based_on=normal_id, next_style=normal_id)
@@ -530,9 +547,24 @@ def add_baseline_marker(document: Document) -> None:
     variables.append(marker)
 
 
-def configure_document(document: Document) -> None:
+def set_setting_flag(document: Document, name: str, enabled: bool) -> None:
+    """设置文档级开关，避免继承源文档的奇偶页眉配置。"""
+    settings = document.settings._element
+    remove_all(settings, name)
+    if enabled:
+        settings.append(OxmlElement("w:" + name))
+
+
+def configure_document(document: Document, profile: str = "general") -> None:
+    if profile not in {"general", "thesis"}:
+        raise ValueError(f"不支持的文档模式：{profile}")
+
+    thesis = profile == "thesis"
     normal_id = document.styles["Normal"].style_id
+    header_id = document.styles["Header"].style_id
     footer_id = document.styles["Footer"].style_id
+    set_setting_flag(document, "evenAndOddHeaders", thesis)
+    remove_all(document.settings._element, "characterSpacingControl")
     for section in document.sections:
         section.page_width = Cm(21)
         section.page_height = Cm(29.7)
@@ -540,18 +572,22 @@ def configure_document(document: Document) -> None:
         section.left_margin = Cm(2)
         section.right_margin = Cm(2)
         section.bottom_margin = Cm(2.7)
-        section.header_distance = Cm(0.8)
-        section.footer_distance = Cm(1.0)
+        section.header_distance = Cm(1.5 if thesis else 0.8)
+        section.footer_distance = Cm(1.75 if thesis else 1.0)
         sect_pr = section._sectPr
+        remove_all(sect_pr, "titlePg")
+        if thesis:
+            sect_pr.append(OxmlElement("w:titlePg"))
         page_number = find(sect_pr, "pgNumType")
         if page_number is None:
             page_number = OxmlElement("w:pgNumType")
             sect_pr.append(page_number)
         page_number.set(tag("start"), "1")
+        remove_attr(page_number, "fmt")
         add_page_field(section, footer_id)
-        clear_container(section.header, normal_id)
-        clear_container(section.first_page_header, normal_id)
-        clear_container(section.even_page_header, normal_id)
+        clear_container(section.header, header_id)
+        clear_container(section.first_page_header, header_id)
+        clear_container(section.even_page_header, header_id)
 
     add_baseline_marker(document)
     properties = document.core_properties
@@ -559,10 +595,10 @@ def configure_document(document: Document) -> None:
         setattr(properties, name, "")
 
 
-def build(output: Path) -> None:
+def build(output: Path, profile: str = "general") -> None:
     document = Document()
     configure_styles(document, reset_numbering=True)
-    configure_document(document)
+    configure_document(document, profile)
     output.parent.mkdir(parents=True, exist_ok=True)
     document.save(output)
 
@@ -570,8 +606,9 @@ def build(output: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="生成干净的中文 DOCX 基线模板")
     parser.add_argument("output", type=Path, help="输出 DOCX 路径")
+    parser.add_argument("--profile", choices=("general", "thesis"), default="general")
     args = parser.parse_args()
-    build(args.output.resolve())
+    build(args.output.resolve(), args.profile)
     print(f"已生成：{args.output.resolve()}")
     return 0
 

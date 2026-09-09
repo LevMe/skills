@@ -68,6 +68,8 @@ def paragraph_style_role(paragraph) -> str | None:
         "标题 3": "Heading 3",
         "Figure Caption": "Figure Caption",
         "Table Caption": "Table Caption",
+        "Figure List": "Figure List",
+        "Table List": "Table List",
         "图题": "Figure Caption",
         "表题": "Table Caption",
         "Reference": "Reference",
@@ -211,6 +213,15 @@ def style_line_twips(style) -> str | None:
     ppr = style_ppr(style)
     spacing = ppr.find(W + "spacing") if ppr is not None else None
     return attribute(spacing, "line")
+
+
+def style_spacing(style) -> dict[str, str | None]:
+    ppr = style_ppr(style)
+    spacing = ppr.find(W + "spacing") if ppr is not None else None
+    return {
+        name: attribute(spacing, name)
+        for name in ("before", "after", "afterLines", "line", "lineRule")
+    }
 
 
 def style_indent(style) -> tuple[str | None, str | None]:
@@ -450,6 +461,19 @@ def check_heading_style_effects(report: dict, doc) -> None:
             linked_issues = effective_style_decoration_issues(doc, linked)
             if style_run_boolean(doc, linked, "b"):
                 linked_issues.append("关联字符样式：不应加粗")
+            expected_font = {
+                "Title": ("黑体", "Times New Roman", 16),
+                "Heading 1": ("黑体", "Times New Roman", 16),
+                "Heading 2": ("黑体", "Times New Roman", 14),
+                "Heading 3": ("黑体", "Times New Roman", 12),
+            }.get(name)
+            if expected_font is not None:
+                linked_fonts = effective_style_fonts(doc, linked)
+                if linked_fonts["eastAsia"] != expected_font[0] or linked_fonts["ascii"] != expected_font[1]:
+                    linked_issues.append(f"字体={linked_fonts}")
+                linked_size = style_size_pt(linked)
+                if linked_size is None or abs(linked_size - expected_font[2]) > 0.01:
+                    linked_issues.append(f"字号={linked_size}")
             if linked_issues:
                 issues.append("关联字符样式：" + ", ".join(linked_issues))
         if issues:
@@ -470,6 +494,31 @@ def check_heading_style_effects(report: dict, doc) -> None:
             add_issue(report, "errors", "HEADING_INDENT", f"{name} 不应有首行或左侧缩进", ", ".join(nonzero_indent))
         if effective_style_has_tabs(doc, style):
             add_issue(report, "errors", "HEADING_TABS", f"{name} 不应包含制表位定义")
+
+        spacing = style_spacing(style)
+        expected_spacing = {
+            "Heading 1": {"before": "0", "after": None, "afterLines": "100", "line": "360"},
+            "Heading 2": {"before": "0", "after": "0", "afterLines": None, "line": "360"},
+            "Heading 3": {"before": "0", "after": "0", "afterLines": None, "line": "360"},
+        }.get(name)
+        if expected_spacing is not None:
+            for property_name, expected in expected_spacing.items():
+                if expected is not None and spacing[property_name] != expected:
+                    add_issue(
+                        report,
+                        "errors",
+                        "HEADING_SPACING",
+                        f"{name} 的 {property_name} 间距不符合规范",
+                        f"实际={spacing[property_name]}，期望={expected}",
+                    )
+                if expected is None and spacing[property_name] is not None:
+                    add_issue(
+                        report,
+                        "errors",
+                        "HEADING_SPACING",
+                        f"{name} 不应设置 {property_name} 间距",
+                        str(spacing[property_name]),
+                    )
 
         ppr = style_ppr(style)
         if name == "Heading 1" and (ppr is None or child(ppr, "pageBreakBefore") is None):
@@ -661,7 +710,22 @@ def check_baseline_marker(report: dict, xml_parts: dict[str, object], require_ba
         add_issue(report, "warnings", "BASELINE_UNVERIFIED", "未验证文档是否来源于本技能空白基线模板")
 
 
-def check_page_and_sections(report: dict, doc, xml_parts: dict[str, object]) -> None:
+def check_legacy_styles(report: dict, doc) -> None:
+    """发现源文档留下的论文专用样式，但不把合法的用户正文当作错误。"""
+    markers = ("lyh_", "mathtype", "endnote bibliography", "mtdisplayequation")
+    residue = [
+        f"{style.style_id}:{style.name}"
+        for style in doc.styles
+        if any(marker in (style.style_id + " " + style.name).lower() for marker in markers)
+    ]
+    report["legacy_styles"] = residue
+    if residue:
+        add_issue(report, "warnings", "LEGACY_STYLE_RESIDUE", "发现源文档专用样式残留", "; ".join(residue[:10]))
+    else:
+        record_check(report, "LEGACY_STYLES", True, "没有发现论文源文档专用样式残留")
+
+
+def check_page_and_sections(report: dict, doc, xml_parts: dict[str, object], profile: str) -> None:
     expected = (21.0, 29.7, 2.0, 2.0, 2.0, 2.7)
     for index, section in enumerate(doc.sections, start=1):
         width = float(section.page_width) / EMU_PER_INCH * CM_PER_INCH
@@ -688,6 +752,27 @@ def check_page_and_sections(report: dict, doc, xml_parts: dict[str, object]) -> 
                 % values,
             )
 
+        if profile == "thesis":
+            header_distance = float(section.header_distance) / EMU_PER_INCH * CM_PER_INCH
+            footer_distance = float(section.footer_distance) / EMU_PER_INCH * CM_PER_INCH
+            distance_passed = (
+                abs(header_distance - 1.5) <= TOLERANCE_CM
+                and abs(footer_distance - 1.75) <= TOLERANCE_CM
+            )
+            record_check(report, f"SECTION_DISTANCE_{index}", distance_passed, f"第 {index} 节页眉页脚距离")
+            if not distance_passed:
+                add_issue(
+                    report,
+                    "errors",
+                    "SECTION_HEADER_FOOTER_DISTANCE",
+                    f"第 {index} 节页眉/页脚距离不符合论文模式",
+                    "实际页眉 %.2f cm，页脚 %.2f cm；期望页眉 1.50 cm，页脚 1.75 cm"
+                    % (header_distance, footer_distance),
+                )
+            sect_pr = doc.sections[index - 1]._sectPr
+            if sect_pr.find(W + "titlePg") is None:
+                add_issue(report, "errors", "THESIS_FIRST_PAGE_HEADER", f"第 {index} 节未设置论文首页页眉分隔")
+
     document_xml = xml_parts.get("word/document.xml")
     starts = [
         attribute(node, "start")
@@ -697,6 +782,28 @@ def check_page_and_sections(report: dict, doc, xml_parts: dict[str, object]) -> 
         add_issue(report, "errors", "PAGE_START", "没有找到正文从 1 开始的页码节属性")
     else:
         record_check(report, "PAGE_START", True, "正文页码起点为 1")
+
+    roman_formats = [
+        attribute(node, "fmt")
+        for node in (document_xml.iter(W + "pgNumType") if document_xml is not None else [])
+        if attribute(node, "fmt") in {"upperRoman", "lowerRoman"}
+    ]
+    if roman_formats:
+        add_issue(report, "errors", "PAGE_ROMAN_FORMAT", "页码不应使用前置罗马数字模式", str(roman_formats))
+    else:
+        record_check(report, "PAGE_ARABIC_FORMAT", True, "未发现前置罗马数字页码定义")
+
+    settings = xml_parts.get("word/settings.xml")
+    even_odd = settings.find(W + "evenAndOddHeaders") if settings is not None else None
+    if settings is not None and list(settings.iter(W + "docGrid")):
+        add_issue(report, "errors", "DOCUMENT_GRID_PRESENT", "文档不应启用文档网格")
+    character_spacing = list(settings.iter(W + "characterSpacingControl")) if settings is not None else []
+    if character_spacing:
+        add_issue(report, "errors", "PUNCTUATION_COMPRESSION", "文档不应启用字符间距或标点压缩设置")
+    if profile == "thesis" and even_odd is None:
+        add_issue(report, "errors", "THESIS_ODD_EVEN_HEADERS", "论文模式未启用奇偶页眉设置")
+    elif profile == "thesis":
+        record_check(report, "THESIS_ODD_EVEN_HEADERS", True, "论文模式已启用奇偶页眉设置")
 
     footer_roots = [root for name, root in xml_parts.items() if name.startswith("word/footer") and root is not None]
     page_field_found = False
@@ -727,19 +834,23 @@ def check_page_and_sections(report: dict, doc, xml_parts: dict[str, object]) -> 
         for name, root in xml_parts.items()
         if name.startswith("word/header") and root is not None
     ).strip()
-    if header_text:
+    if header_text and profile != "thesis":
         add_issue(report, "warnings", "HEADER_PRESENT", "发现非空页眉；默认基线不设置固定页眉")
+    elif profile == "thesis":
+        record_check(report, "THESIS_HEADER", bool(header_text), "论文模式保留用户提供的页眉文字；未虚构学校信息")
 
 
 def check_styles(report: dict, doc, profile: str) -> None:
     common = [
         ("Normal", {"Normal"}, "宋体", "Times New Roman", 12, WD_ALIGN_PARAGRAPH.JUSTIFY, "360", "200", None),
         ("Title", {"Title"}, "黑体", "Times New Roman", 16, WD_ALIGN_PARAGRAPH.CENTER, "360", None, None),
-        ("Heading 1", {"Heading1"}, "黑体", "Times New Roman", 16, WD_ALIGN_PARAGRAPH.CENTER, None, None, "0"),
-        ("Heading 2", {"Heading2"}, "黑体", "Times New Roman", 14, WD_ALIGN_PARAGRAPH.LEFT, None, None, "1"),
-        ("Heading 3", {"Heading3"}, "黑体", "Times New Roman", 12, WD_ALIGN_PARAGRAPH.LEFT, None, None, "2"),
+        ("Heading 1", {"Heading1"}, "黑体", "Times New Roman", 16, WD_ALIGN_PARAGRAPH.CENTER, "360", None, "0"),
+        ("Heading 2", {"Heading2"}, "黑体", "Times New Roman", 14, WD_ALIGN_PARAGRAPH.LEFT, "360", None, "1"),
+        ("Heading 3", {"Heading3"}, "黑体", "Times New Roman", 12, WD_ALIGN_PARAGRAPH.LEFT, "360", None, "2"),
         ("Figure Caption", {"Figure Caption"}, "楷体", "Times New Roman", 10.5, WD_ALIGN_PARAGRAPH.CENTER, "300", None, None),
         ("Table Caption", {"Table Caption"}, "楷体", "Times New Roman", 10.5, WD_ALIGN_PARAGRAPH.CENTER, "300", None, None),
+        ("Figure List", {"FigureList"}, "楷体", "Times New Roman", 10.5, WD_ALIGN_PARAGRAPH.LEFT, "300", None, None),
+        ("Table List", {"TableList"}, "楷体", "Times New Roman", 10.5, WD_ALIGN_PARAGRAPH.LEFT, "300", None, None),
         ("Equation", {"Equation"}, "Cambria Math", "Cambria Math", 12, WD_ALIGN_PARAGRAPH.CENTER, None, None, None),
         ("Reference", {"Reference"}, "宋体", "Times New Roman", 12, None, None, None, None),
         ("Abstract Body", {"Abstract Body"}, "宋体", "Times New Roman", 14, WD_ALIGN_PARAGRAPH.JUSTIFY, "360", "200", None),
@@ -774,6 +885,19 @@ def check_styles(report: dict, doc, profile: str) -> None:
         style = find_style(doc, {f"Heading {level}"}, {f"Heading{level}"})
         if style is not None:
             record_check(report, f"HEADING_STYLE_{level}", True, f"Heading {level} 样式存在")
+
+    for level in range(1, 4):
+        check_style(
+            report,
+            doc,
+            f"TOC {level}",
+            {f"TOC{level}"},
+            east_asia="宋体",
+            latin="Times New Roman",
+            size=12,
+            alignment=WD_ALIGN_PARAGRAPH.LEFT,
+            line="300",
+        )
 
     check_style_inheritance(report, doc)
     check_heading_style_effects(report, doc)
@@ -840,6 +964,8 @@ def check_headings_and_title(report: dict, doc) -> None:
         if level is None:
             continue
         seen_heading = True
+        if paragraph.text != paragraph.text.lstrip(" \t\u00a0"):
+            add_issue(report, "errors", "HEADING_TEXT_INDENT", f"{role} 文本开头含有空格或制表符", repr(paragraph.text[:20]))
         expected_prefix = {
             1: r"^(第[一二三四五六七八九十百零]+章|附录\s*[0-9A-Za-z]+)",
             2: r"^\d+\.\d+",
@@ -1080,7 +1206,7 @@ def check_captions_tables_images(report: dict, doc, xml_parts: dict[str, object]
                 add_issue(report, "errors", "TABLE_CAPTION_NUMBER", "表题没有使用章号.表号格式", text)
             else:
                 table_numbers.append(number)
-        elif re.match(r"^(图|表)\s*[0-9]", text) and role not in {"Figure Caption", "Table Caption"}:
+        elif re.match(r"^(图|表)\s*[0-9]", text) and not (role and (role.startswith("TOC") or role.endswith("List"))) and role not in {"Figure Caption", "Table Caption"}:
             add_issue(report, "errors", "CAPTION_STYLE", "图题或表题没有使用规范样式", text)
 
     for label, numbers in (("图", figure_numbers), ("表", table_numbers)):
@@ -1123,11 +1249,23 @@ def check_captions_tables_images(report: dict, doc, xml_parts: dict[str, object]
             add_issue(report, "warnings", "TABLE_STYLE_BORDERS", "表格依赖网格样式而非完整显式边框", ", ".join(border_issues))
 
         table_width, grid_widths = table_widths(table)
+        if table_width is None:
+            add_issue(report, "errors", "TABLE_WIDTH_MISSING", "表格没有设置明确的总宽度")
+        if not grid_widths:
+            add_issue(report, "errors", "TABLE_GRID_MISSING", "表格没有设置明确的列宽网格")
         if available_width is not None:
             if table_width is not None and table_width > available_width + 24:
                 add_issue(report, "errors", "TABLE_WIDTH", "表格总宽度超过版心", f"表格={table_width} twips，版心={available_width} twips")
             if grid_widths and sum(grid_widths) > available_width + 24:
                 add_issue(report, "errors", "TABLE_GRID_WIDTH", "表格列宽总和超过版心", f"列宽总和={sum(grid_widths)} twips，版心={available_width} twips")
+        if table_width is not None and grid_widths and abs(sum(grid_widths) - table_width) > 24:
+            add_issue(
+                report,
+                "errors",
+                "TABLE_GRID_MISMATCH",
+                "表格总宽度与列宽网格不一致",
+                f"表格={table_width} twips，列宽总和={sum(grid_widths)} twips",
+            )
         if len(tbl.findall(W + "tr")) >= 6 and not first_row_repeats(table):
             add_issue(report, "warnings", "TABLE_HEADER_REPEAT", "长表格首行没有设置跨页重复")
         for row in tbl.findall(W + "tr"):
@@ -1261,7 +1399,7 @@ def audit(path: Path, requested_profile: str, require_baseline: bool = False) ->
         "direct_formatting": {},
         "images": {},
         "visual": {
-            "status": "not_checked",
+            "status": "视觉待验收",
             "message": "结构审计不包含真实页面渲染，必须另行完成 Word PDF 到 PNG 的视觉验收",
         },
     }
@@ -1291,8 +1429,9 @@ def audit(path: Path, requested_profile: str, require_baseline: bool = False) ->
     else:
         report["profile"] = requested_profile
 
-    check_page_and_sections(report, doc, xml_parts)
+    check_page_and_sections(report, doc, xml_parts, report["profile"])
     check_baseline_marker(report, xml_parts, require_baseline)
+    check_legacy_styles(report, doc)
     check_styles(report, doc, report["profile"])
     check_numbering_bindings(report, doc, xml_parts)
     check_direct_formatting(report, doc)
