@@ -219,6 +219,28 @@ def style_indent(style) -> tuple[str | None, str | None]:
     return attribute(indent, "firstLineChars"), attribute(indent, "firstLine")
 
 
+def style_boolean(doc, style, name: str) -> bool:
+    """按继承链解析开关属性，显式 false 也必须覆盖父样式。"""
+    chain, _, _ = style_chain(doc, style)
+    for current in chain:
+        node = child(style_ppr(current), name)
+        if node is None:
+            continue
+        return attribute(node, "val") not in {"0", "false", "off", "no"}
+    return False
+
+
+def style_run_boolean(doc, style, name: str) -> bool:
+    """解析字符属性中的加粗、倾斜和不检查拼写等开关。"""
+    chain, _, _ = style_chain(doc, style)
+    for current in chain:
+        node = child(style_rpr(current), name)
+        if node is None:
+            continue
+        return attribute(node, "val") not in {"0", "false", "off", "no"}
+    return False
+
+
 def style_linked_character(doc, style):
     """返回段落样式关联的字符样式。"""
     link = child(style_xml(style), "link")
@@ -248,6 +270,7 @@ def paragraph_in_table(paragraph) -> bool:
 
 def paragraph_has_field(paragraph, token: str | None = None) -> bool:
     instructions = " ".join((node.text or "") for node in paragraph._p.iter(W + "instrText"))
+    instructions += " " + " ".join(attribute(node, "instr") or "" for node in paragraph._p.iter(W + "fldSimple"))
     if token is None:
         return bool(instructions.strip())
     return token.upper() in instructions.upper()
@@ -388,15 +411,43 @@ def check_heading_style_effects(report: dict, doc) -> None:
         if issues:
             add_issue(report, "errors", "STYLE_EFFECTIVE_DECORATION", f"{name} 样式仍含非规范视觉属性", "; ".join(issues))
 
+        if not style_run_boolean(doc, style, "b"):
+            add_issue(report, "errors", "STYLE_BOLD", f"{name} 没有设置黑体所需的加粗属性")
+        if style_run_boolean(doc, style, "i"):
+            add_issue(report, "errors", "STYLE_ITALIC", f"{name} 不应继承倾斜属性")
+
         ppr = style_ppr(style)
         if name == "Heading 1" and (ppr is None or child(ppr, "pageBreakBefore") is None):
             add_issue(report, "errors", "HEADING1_PAGE_BREAK", "Heading 1 没有设置章节起始分页")
+        if name in {"Title", "Heading 2", "Heading 3"} and style_boolean(doc, style, "pageBreakBefore"):
+            add_issue(report, "errors", "UNEXPECTED_PAGE_BREAK", f"{name} 不应设置段前分页")
         if name.startswith("Heading") and (ppr is None or child(ppr, "keepNext") is None or child(ppr, "keepLines") is None):
             add_issue(report, "warnings", "HEADING_KEEP_TOGETHER", f"{name} 未同时设置保持标题完整和与下段同页")
+
+        if name.startswith("Heading") and not style_boolean(doc, style, "keepNext"):
+            add_issue(report, "errors", "HEADING_KEEP_NEXT", f"{name} 没有设置与下段同页")
+        if name.startswith("Heading") and not style_boolean(doc, style, "keepLines"):
+            add_issue(report, "errors", "HEADING_KEEP_LINES", f"{name} 没有设置保持段中不分页")
+
+    normal = find_style(doc, {"Normal"}, {"Normal"})
+    if normal is not None:
+        if style_run_boolean(doc, normal, "b"):
+            add_issue(report, "errors", "NORMAL_BOLD", "Normal 不应默认加粗")
+        if style_run_boolean(doc, normal, "i"):
+            add_issue(report, "errors", "NORMAL_ITALIC", "Normal 不应默认倾斜")
+        for property_name, code, message in (
+            ("pageBreakBefore", "NORMAL_PAGE_BREAK", "Normal 不应设置段前分页"),
+            ("keepNext", "NORMAL_KEEP_NEXT", "Normal 不应默认与下段同页"),
+            ("keepLines", "NORMAL_KEEP_LINES", "Normal 不应默认保持段中不分页"),
+        ):
+            if style_boolean(doc, normal, property_name):
+                add_issue(report, "errors", code, message)
 
     code = find_style(doc, {"Code Block", "CodeBlock"}, {"CodeBlock"})
     if code is not None and style_alignment(code) != WD_ALIGN_PARAGRAPH.LEFT:
         add_issue(report, "errors", "CODE_ALIGNMENT", "代码或技术文本样式没有左对齐")
+    if code is not None and not style_run_boolean(doc, code, "noProof"):
+        add_issue(report, "warnings", "CODE_PROOFING", "代码或技术文本样式未关闭拼写检查")
 
 
 def check_style_inheritance(report: dict, doc) -> None:
@@ -440,11 +491,11 @@ def numbering_level(xml_parts: dict[str, object], num_id: str | None, ilvl: str 
 def check_numbering_bindings(report: dict, doc, xml_parts: dict[str, object]) -> None:
     """解析 numId 到 abstractNum，防止只看到编号属性却忽略实际编号格式。"""
     expected = {
-        "Heading 1": ("0", "chineseCounting", "第%1章"),
-        "Heading 2": ("1", "decimal", "%1.%2"),
-        "Heading 3": ("2", "decimal", "%1.%2.%3"),
+        "Heading 1": ("0", "chineseCounting", "第%1章", False),
+        "Heading 2": ("1", "decimal", "%1.%2", True),
+        "Heading 3": ("2", "decimal", "%1.%2.%3", True),
     }
-    for name, (expected_level, expected_format, expected_text) in expected.items():
+    for name, (expected_level, expected_format, expected_text, expected_legal) in expected.items():
         style = find_style(doc, {name}, {name.replace(" ", "")})
         if style is None:
             continue
@@ -456,6 +507,7 @@ def check_numbering_bindings(report: dict, doc, xml_parts: dict[str, object]) ->
         actual_format = attribute(child(level, "numFmt"), "val")
         actual_text = attribute(child(level, "lvlText"), "val")
         level_style = attribute(child(child(level, "pPr"), "pStyle"), "val")
+        actual_legal = child(level, "isLgl") is not None
         if actual_level != expected_level or actual_format != expected_format or actual_text != expected_text:
             add_issue(
                 report,
@@ -463,6 +515,14 @@ def check_numbering_bindings(report: dict, doc, xml_parts: dict[str, object]) ->
                 "NUMBERING_DEFINITION",
                 f"{name} 的实际编号格式不符合规范",
                 f"级别={actual_level}, 格式={actual_format}, 文本={actual_text}",
+            )
+        if actual_legal != expected_legal:
+            add_issue(
+                report,
+                "errors",
+                "NUMBERING_LEGAL_MODE",
+                f"{name} 的编号没有正确设置 Word 阿拉伯数字兼容模式",
+                f"isLgl={actual_legal}，期望={expected_legal}",
             )
         if level_style not in {style.style_id, name.replace(" ", "")}:
             add_issue(report, "errors", "NUMBERING_STYLE_LINK", f"{name} 的编号级别没有绑定自身样式", str(level_style))
@@ -570,7 +630,15 @@ def check_page_and_sections(report: dict, doc, xml_parts: dict[str, object]) -> 
                 continue
             page_field_found = True
             alignment = paragraph.find(W + "pPr/" + W + "jc")
-            if attribute(alignment, "val") != "center":
+            direct_alignment = attribute(alignment, "val")
+            style_node = paragraph.find(W + "pPr/" + W + "pStyle")
+            style = find_style(doc, set(), {attribute(style_node, "val")} if style_node is not None else set())
+            effective_alignment = direct_alignment or (
+                {WD_ALIGN_PARAGRAPH.LEFT: "left", WD_ALIGN_PARAGRAPH.CENTER: "center", WD_ALIGN_PARAGRAPH.RIGHT: "right", WD_ALIGN_PARAGRAPH.JUSTIFY: "both"}.get(style_alignment(style))
+                if style is not None
+                else None
+            )
+            if effective_alignment != "center":
                 add_issue(report, "errors", "PAGE_ALIGNMENT", "页码字段所在段落没有居中")
     if not page_field_found:
         add_issue(report, "errors", "PAGE_FIELD", "页脚没有找到 PAGE 页码字段")
@@ -638,7 +706,8 @@ def check_direct_formatting(report: dict, doc) -> None:
     direct_paragraphs = 0
     direct_runs = 0
     table_direct_paragraphs = 0
-    allowed_ppr = {W + "pStyle", W + "numPr"}
+    allowed_ppr = {W + "pStyle", W + "numPr", W + "sectPr"}
+    allowed_rpr = {W + "rStyle", W + "vertAlign", W + "lang", W + "rtl", W + "noProof"}
     for paragraph in all_paragraphs(doc):
         is_page_field = paragraph_has_field(paragraph, "PAGE")
         ppr = paragraph._p.find(W + "pPr")
@@ -650,7 +719,7 @@ def check_direct_formatting(report: dict, doc) -> None:
                 direct_paragraphs += 1
         for run in paragraph.runs:
             rpr = run._r.find(W + "rPr")
-            if rpr is not None and any(child.tag != W + "rStyle" for child in rpr) and not is_page_field:
+            if rpr is not None and any(child.tag not in allowed_rpr for child in rpr) and not is_page_field:
                 direct_runs += 1
     report["direct_formatting"] = {
         "paragraphs": direct_paragraphs,
@@ -821,6 +890,20 @@ def check_toc(report: dict, doc, xml_parts: dict[str, object]) -> None:
     instructions = all_field_instructions(toc_root)
     has_toc_title = any(text in {"目录", "目 录"} for text in texts)
     has_toc_field = "TOC" in instructions.upper()
+    cached_entries = []
+    if toc_root is not None:
+        for paragraph in toc_root.iter(W + "p"):
+            if not any(node.tag == W + "hyperlink" for node in paragraph.iter()):
+                continue
+            value = clean(xml_text(paragraph))
+            if value:
+                cached_entries.append(value)
+    report["toc"] = {
+        "field_present": has_toc_field,
+        "update_fields": None,
+        "cached_entry_count": len(cached_entries),
+        "cached_entries": cached_entries[:20],
+    }
     if has_toc_title and not has_toc_field:
         add_issue(report, "errors", "TOC_FIELD_MISSING", "存在目录标题但没有真实 TOC 字段")
     if has_toc_field:
@@ -831,8 +914,14 @@ def check_toc(report: dict, doc, xml_parts: dict[str, object]) -> None:
         if settings is not None:
             update = settings.find(W + "updateFields")
             update_value = attribute(update, "val")
+        report["toc"]["update_fields"] = update_value
         if update_value != "true":
             add_issue(report, "warnings", "TOC_UPDATE_FIELDS", "TOC 字段未设置打开文档时更新")
+        if not cached_entries:
+            add_issue(report, "warnings", "TOC_CACHE_EMPTY", "TOC 字段没有缓存条目；需在 Word 中更新目录")
+        mixed = [value for value in cached_entries if re.match(r"^[一二三四五六七八九十百千万零〇]+[.．]", value)]
+        if mixed:
+            add_issue(report, "errors", "TOC_MIXED_NUMBERING", "目录缓存含有中文数字与阿拉伯小节号混排", str(mixed[:5]))
         record_check(report, "TOC_FIELD", True, "找到真实 TOC 字段")
 
 

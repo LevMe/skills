@@ -10,6 +10,7 @@
 - 默认 A4 纵向，上、左、右边距 2 cm，下边距 2.7 cm。
 - 正文小四号宋体、两端对齐、首行缩进两字符、1.5 倍行距；代码和接口标识使用左对齐样式。
 - 标题使用真实的 Heading 1、Heading 2、Heading 3 样式和模板多级编号。
+- 多级编号使用 Word `isLgl` 规则，一级显示“第一章”，二、三级显示“1.1”“1.1.1”，避免“二.1”。
 - 摘要、英文摘要、目录、图表目录、参考文献和附录按实际内容条件生成。
 - 图题和表题使用五号楷体；图像优先使用行内对象；表格使用可见网格。
 - 公式使用原生可编辑 OMML，不使用 MathType OLE 或原始 LaTeX。
@@ -46,6 +47,12 @@ macOS 或 Linux：
 
 毕业论文或学位论文建议明确写“论文模式”；报告、方案或制度建议明确写“通用正式文档模式”。
 
+已有 DOCX 应迁移到新输出文件，不要覆盖原文档：
+
+    python chinese-docx-format/scripts/format_chinese_docx.py 输入.docx --output 输出.docx --profile auto
+
+该脚本会清除源文档的标题样式污染和直接格式，重建标题编号，保留正文、表格、图片和 OMML。新文档使用 `assets/chinese-docx-base-template.docx`。
+
 ## 结构审计
 
 使用 Codex 文档运行环境中的 Python 执行：
@@ -60,7 +67,7 @@ macOS 或 Linux：
 
     powershell -File chinese-docx-format/scripts/render_docx_windows.ps1 -InputPath 输入.docx -OutputDirectory 渲染目录
 
-脚本使用 Windows PowerShell 5.1 调用 Microsoft Word 原生导出 PDF，再用环境中的 Poppler 转为页面图片并逐页检查；不依赖 LibreOffice。脚本会先检查 Word 是否能创建临时文档，失败时直接报告工作文件环境问题。没有可用 Word 渲染器时，只能交付结构检查结果，并明确标注“视觉验收未完成”。
+脚本使用 Windows PowerShell 5.1 调用 Microsoft Word 原生导出 PDF，再用环境中的 Poppler 转为页面图片并逐页检查；LibreOffice 不是硬依赖。脚本会先检查 Word 是否能创建临时文档，失败时直接报告工作文件环境问题。没有可用 Word 渲染器时，只能交付结构检查结果，并明确标注“视觉验收未完成”。
 
 ## 文件说明
 
@@ -71,6 +78,8 @@ macOS 或 Linux：
 | references/format-spec.md | 详细格式规范 |
 | references/qa-checklist.md | 交付前检查清单 |
 | assets/chinese-docx-base-template.docx | 去内容化的 Word 基线模板 |
+| scripts/build_base_template.py | 可重复生成干净基线模板 |
+| scripts/format_chinese_docx.py | 将已有 DOCX 迁移到新输出文件 |
 | scripts/audit_chinese_docx.py | 只读结构审计器 |
 | scripts/render_docx_windows.ps1 | 使用 Microsoft Word 导出 PDF 的视觉验收脚本 |
 
