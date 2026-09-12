@@ -320,6 +320,26 @@ def paragraph_has_field(paragraph, token: str | None = None) -> bool:
     return token.upper() in instructions.upper()
 
 
+def technical_text_signal(text: str) -> bool:
+    """识别多行代码、JSON、调用链和目录树，避免被当作普通正文。"""
+    if not text:
+        return False
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in normalized.split("\n") if line.strip()]
+    flat = clean(text)
+    markers = ("::", "=>", "->", "↓", "{", "}", "GET ", "POST ", "SELECT ", "import ", "from ", "def ", "class ")
+    line_markers = markers[6:] + ("DELETE ", "PUT ", "curl ", "python ", "mvn ", "npm ")
+    marker_count = sum(flat.count(marker) for marker in markers)
+    path_count = flat.count("/") + flat.count("\\")
+    return bool(
+        any(line.startswith(line_markers) for line in lines)
+        or any(line.startswith(("├", "└", "│", "↓", "↳")) for line in lines)
+        or ("\n" in normalized and (marker_count >= 1 or path_count >= 2))
+        or marker_count >= 2
+        or (len(lines) > 1 and path_count >= 3)
+    )
+
+
 def append_table_paragraphs(result: list, tables) -> None:
     for table in tables:
         for row in table.rows:
@@ -769,10 +789,6 @@ def check_page_and_sections(report: dict, doc, xml_parts: dict[str, object], pro
                     "实际页眉 %.2f cm，页脚 %.2f cm；期望页眉 1.50 cm，页脚 1.75 cm"
                     % (header_distance, footer_distance),
                 )
-            sect_pr = doc.sections[index - 1]._sectPr
-            if sect_pr.find(W + "titlePg") is None:
-                add_issue(report, "errors", "THESIS_FIRST_PAGE_HEADER", f"第 {index} 节未设置论文首页页眉分隔")
-
     document_xml = xml_parts.get("word/document.xml")
     starts = [
         attribute(node, "start")
@@ -800,18 +816,37 @@ def check_page_and_sections(report: dict, doc, xml_parts: dict[str, object], pro
     character_spacing = list(settings.iter(W + "characterSpacingControl")) if settings is not None else []
     if character_spacing:
         add_issue(report, "errors", "PUNCTUATION_COMPRESSION", "文档不应启用字符间距或标点压缩设置")
-    if profile == "thesis" and even_odd is None:
-        add_issue(report, "errors", "THESIS_ODD_EVEN_HEADERS", "论文模式未启用奇偶页眉设置")
-    elif profile == "thesis":
-        record_check(report, "THESIS_ODD_EVEN_HEADERS", True, "论文模式已启用奇偶页眉设置")
 
-    footer_roots = [root for name, root in xml_parts.items() if name.startswith("word/footer") and root is not None]
+    document_xml = xml_parts.get("word/document.xml")
+    special_references = []
+    title_page_sections = 0
+    for section in doc.sections:
+        sect_pr = section._sectPr
+        if sect_pr.find(W + "titlePg") is not None:
+            title_page_sections += 1
+        for reference_name in ("headerReference", "footerReference"):
+            for reference in sect_pr.findall(W + reference_name):
+                reference_type = attribute(reference, "type") or "default"
+                if reference_type != "default":
+                    special_references.append(f"{reference_name}:{reference_type}")
+    if title_page_sections:
+        add_issue(report, "errors", "TITLE_PAGE_FOOTER_GAP", "文档启用了首页特殊页眉页脚，可能造成首页缺少页码", str(title_page_sections))
+    if even_odd is not None:
+        add_issue(report, "errors", "ODD_EVEN_FOOTER_GAP", "文档启用了奇偶页眉页脚，但本技能只允许统一页脚")
+    if special_references:
+        add_issue(report, "errors", "SPECIAL_SECTION_REFERENCE", "文档含有未配套的首页或奇偶页眉页脚引用", "; ".join(special_references))
+
+    footer_roots = [(name, root) for name, root in xml_parts.items() if name.startswith("word/footer") and root is not None]
     page_field_found = False
-    for root in footer_roots:
+    page_field_counts = {}
+    for name, root in footer_roots:
+        count = 0
         for paragraph in root.iter(W + "p"):
             instructions = all_field_instructions(paragraph)
-            if "PAGE" not in instructions.upper():
+            field_count = len(re.findall(r"\bPAGE\b", instructions, re.IGNORECASE))
+            if not field_count:
                 continue
+            count += field_count
             page_field_found = True
             alignment = paragraph.find(W + "pPr/" + W + "jc")
             direct_alignment = attribute(alignment, "val")
@@ -824,6 +859,10 @@ def check_page_and_sections(report: dict, doc, xml_parts: dict[str, object], pro
             )
             if effective_alignment != "center":
                 add_issue(report, "errors", "PAGE_ALIGNMENT", "页码字段所在段落没有居中")
+        page_field_counts[name] = count
+        if count > 1:
+            add_issue(report, "errors", "PAGE_FIELD_DUPLICATE", "同一页脚含有多个 PAGE 字段，页码可能重影", f"{name}：{count} 个")
+    report["page_fields"] = page_field_counts
     if not page_field_found:
         add_issue(report, "errors", "PAGE_FIELD", "页脚没有找到 PAGE 页码字段")
     else:
@@ -930,7 +969,7 @@ def check_direct_formatting(report: dict, doc) -> None:
     if direct_paragraphs or direct_runs:
         add_issue(
             report,
-            "warnings",
+            "errors",
             "DIRECT_FORMATTING",
             "发现直接段落或字符格式；应优先回收到样式",
             f"段落 {direct_paragraphs} 处，字符 {direct_runs} 处",
@@ -956,6 +995,15 @@ def check_headings_and_title(report: dict, doc) -> None:
             if borders is not None and any(attribute(item, "val") not in {None, "none"} for item in list(borders)):
                 add_issue(report, "errors", "TITLE_DIRECT_BORDER", "文档标题段落含有直接段落边框")
 
+    unsupported = [
+        clean(paragraph.text)
+        for paragraph in doc.paragraphs
+        if paragraph.style is not None
+        and (paragraph.style.style_id.lower() in {"heading4", "标题4"} or paragraph.style.name.lower() in {"heading 4", "标题 4"})
+    ]
+    if unsupported:
+        add_issue(report, "errors", "HEADING4_UNSUPPORTED", "文档仍使用未定义的四级标题样式", "; ".join(unsupported[:5]))
+
     previous_level = 0
     seen_heading = False
     for paragraph in doc.paragraphs:
@@ -980,12 +1028,52 @@ def check_headings_and_title(report: dict, doc) -> None:
                 clean(paragraph.text),
             )
         style = paragraph.style
+        ppr = paragraph._p.find(W + "pPr")
+        if ppr is not None and child(ppr, "numPr") is not None:
+            add_issue(report, "errors", "HEADING_DIRECT_NUMBERING", f"{role} 使用了段落直接编号，应由样式编号统一控制")
         ilvl, num_id = style_numpr(style)
         if ilvl != str(level - 1) or not num_id:
             add_issue(report, "errors", "HEADING_NUMBERING", f"{role} 没有使用模板多级编号")
         if seen_heading and level > previous_level + 1 and previous_level:
             add_issue(report, "errors", "HEADING_LEVEL_JUMP", f"标题层级从 {previous_level} 级跳到 {level} 级")
         previous_level = level
+
+
+def check_content_layout(report: dict, doc) -> None:
+    """检查会直接造成视觉错乱的正文空白、制表位和技术段落样式。"""
+    allowed_tab_roles = {"TOC 1", "TOC 2", "TOC 3", "Figure List", "Table List", "Equation"}
+    for index, paragraph in enumerate(doc.paragraphs, start=1):
+        role = paragraph_style_role(paragraph)
+        text = paragraph.text or ""
+        if not text.strip(" \t\r\n\u00a0") and not paragraph_has_field(paragraph):
+            has_object = any(
+                node.tag in {W + "drawing", W + "object", W + "pict", M + "oMath", M + "oMathPara"}
+                for node in paragraph._p.iter()
+            )
+            if not has_object:
+                add_issue(report, "errors", "EMPTY_LAYOUT_PARAGRAPH", "正文含有只用于撑开版式的空段落", f"第 {index} 个段落")
+            continue
+
+        if role in {"Heading 1", "Heading 2", "Heading 3", "Appendix Heading"} and "\t" in text:
+            add_issue(report, "errors", "HEADING_TEXT_TAB", f"{role} 文本含有制表位", repr(text[:60]))
+
+        if role not in {"Code Block", *allowed_tab_roles} and text.startswith((" ", "\t", "\u00a0")):
+            add_issue(report, "errors", "LAYOUT_TEXT_WHITESPACE", "段落开头含有用于排版的空格或制表位", f"第 {index} 个段落：{repr(text[:40])}")
+
+        if role == "Normal":
+            break_count = len(paragraph._p.findall(".//" + W + "br"))
+            if "\t" in text:
+                add_issue(report, "errors", "BODY_TAB_LAYOUT", "普通正文含有制表位，不能用制表位模拟版式", f"第 {index} 个段落")
+            if break_count and technical_text_signal(text):
+                add_issue(
+                    report,
+                    "errors",
+                    "TECHNICAL_PARAGRAPH_STYLE",
+                    "多行技术内容被当作普通正文，可能触发两端对齐的异常字间距",
+                    f"第 {index} 个段落，手工换行 {break_count} 处",
+                )
+            elif break_count:
+                add_issue(report, "warnings", "MANUAL_LINE_BREAK", "普通正文含有手工换行，请确认不是代码或排版占位", f"第 {index} 个段落")
 
 
 def check_appendix(report: dict, doc, xml_parts: dict[str, object]) -> None:
@@ -1266,13 +1354,33 @@ def check_captions_tables_images(report: dict, doc, xml_parts: dict[str, object]
                 "表格总宽度与列宽网格不一致",
                 f"表格={table_width} twips，列宽总和={sum(grid_widths)} twips",
             )
+        if grid_widths and min(grid_widths) < 720:
+            add_issue(report, "warnings", "TABLE_COLUMN_NARROW", "表格存在过窄列，长标识可能被拆成难读的字符块", str(grid_widths))
         if len(tbl.findall(W + "tr")) >= 6 and not first_row_repeats(table):
             add_issue(report, "warnings", "TABLE_HEADER_REPEAT", "长表格首行没有设置跨页重复")
         for row in tbl.findall(W + "tr"):
             tr_pr = row.find(W + "trPr")
+            if tr_pr is not None and tr_pr.find(W + "cantSplit") is not None:
+                add_issue(report, "warnings", "TABLE_ROW_CANNOT_SPLIT", "表格行禁止跨页拆分，长行可能制造大段空白")
             height = tr_pr.find(W + "trHeight") if tr_pr is not None else None
             if height is not None and attribute(height, "hRule") == "exact":
                 add_issue(report, "errors", "TABLE_FIXED_HEIGHT", "表格使用 exact 固定行高，存在截断风险")
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    text = clean(paragraph.text)
+                    if len(text) < 40:
+                        continue
+                    ppr = paragraph._p.find(W + "pPr")
+                    alignment = attribute(child(ppr, "jc"), "val") if ppr is not None else None
+                    if alignment in {"center", "right", "both"}:
+                        add_issue(
+                            report,
+                            "warnings",
+                            "TABLE_NARRATIVE_ALIGNMENT",
+                            "表格长叙述内容不应默认居中或两端对齐",
+                            text[:80],
+                        )
 
 
 def check_equations(report: dict, xml_parts: dict[str, object]) -> None:
@@ -1436,6 +1544,7 @@ def audit(path: Path, requested_profile: str, require_baseline: bool = False) ->
     check_numbering_bindings(report, doc, xml_parts)
     check_direct_formatting(report, doc)
     check_headings_and_title(report, doc)
+    check_content_layout(report, doc)
     check_appendix(report, doc, xml_parts)
     check_abstracts(report, doc)
     check_toc(report, doc, xml_parts)

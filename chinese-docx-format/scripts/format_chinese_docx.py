@@ -10,10 +10,11 @@ from __future__ import annotations
 import argparse
 import copy
 import re
+import unicodedata
 from pathlib import Path
 
 from docx import Document
-from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.opc.part import Part
 from docx.oxml import OxmlElement
@@ -51,6 +52,37 @@ def in_table(paragraph) -> bool:
             return True
         node = node.getparent()
     return False
+
+
+def is_layout_only_paragraph(paragraph) -> bool:
+    """识别只含空格、制表位或分页符的正文段落。"""
+    if (paragraph.text or "").strip(" \t\r\n\u00a0"):
+        return False
+    meaningful = {
+        tag_name
+        for tag_name in (
+            tag("drawing"),
+            tag("object"),
+            tag("pict"),
+            tag("oMath"),
+            tag("oMathPara"),
+            tag("instrText"),
+            tag("fldSimple"),
+            tag("hyperlink"),
+            tag("footnoteReference"),
+            tag("endnoteReference"),
+        )
+    }
+    return not any(node.tag in meaningful for node in paragraph._p.iter())
+
+
+def meaningful_paragraphs(document: Document) -> list:
+    """过滤正文中的版式占位段落，但保留表格单元格内的空段落。"""
+    return [
+        paragraph
+        for paragraph in all_paragraphs(document)
+        if in_table(paragraph) or not is_layout_only_paragraph(paragraph)
+    ]
 
 
 def has_omml(paragraph) -> bool:
@@ -131,10 +163,19 @@ def clear_main_body(document: Document) -> None:
 def source_body_content(source: Document) -> list:
     """复制正文和表格节点，不复制源文档的节属性。"""
     content = []
+    top_level_paragraphs = {id(paragraph._p): paragraph for paragraph in source.paragraphs}
     for child in list(source._body._element):
         if child.tag == tag("sectPr"):
             continue
+        if child.tag == tag("p"):
+            paragraph = top_level_paragraphs.get(id(child))
+            if paragraph is not None and is_layout_only_paragraph(paragraph):
+                continue
         node = copy.deepcopy(child)
+        for marker in list(node.iter(tag("lastRenderedPageBreak"))):
+            parent = marker.getparent()
+            if parent is not None:
+                parent.remove(marker)
         for sect_pr in list(node.iter(tag("sectPr"))):
             parent = sect_pr.getparent()
             if parent is not None:
@@ -236,12 +277,10 @@ def set_header_text(container, text: str, style_id: str) -> None:
 
 
 def copy_thesis_headers(source: Document, target: Document) -> None:
-    """论文模式保留源文档已有页眉文字，但不虚构学校或学位信息。"""
+    """论文模式只保留源文档普通页眉文字，不创建特殊页眉引用。"""
     section = target.sections[0]
     header_id = target.styles["Header"].style_id
     set_header_text(section.header, first_nonempty_header_text(source, "header"), header_id)
-    set_header_text(section.even_page_header, first_nonempty_header_text(source, "even_page_header"), header_id)
-    set_header_text(section.first_page_header, first_nonempty_header_text(source, "first_page_header"), header_id)
 
 
 def looks_like_heading(text: str) -> int | None:
@@ -259,9 +298,11 @@ def looks_like_heading(text: str) -> int | None:
 
 
 def is_technical(text: str, raw_text: str | None = None) -> bool:
-    if not text or len(text) > 240:
+    if not text:
         return False
     raw_text = raw_text or text
+    normalized_raw = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in normalized_raw.split("\n") if line.strip()]
     technical_markers = (
         "::",
         "=>",
@@ -278,13 +319,37 @@ def is_technical(text: str, raw_text: str | None = None) -> bool:
         "from ",
         "def ",
         "class ",
+        "curl ",
+        "python ",
+        "mvn ",
+        "npm ",
     )
-    if any(text.startswith(marker) for marker in ("GET ", "POST ", "PUT ", "DELETE ", "SELECT ", "import ", "from ", "def ", "class ")):
+    line_markers = (
+        "GET ",
+        "POST ",
+        "PUT ",
+        "DELETE ",
+        "SELECT ",
+        "import ",
+        "from ",
+        "def ",
+        "class ",
+        "curl ",
+        "python ",
+        "mvn ",
+        "npm ",
+    )
+    if any(line.startswith(line_markers) for line in lines):
         return True
     marker_count = sum(text.count(marker) for marker in technical_markers)
+    path_count = text.count("/") + text.count("\\")
+    if any(line.startswith(("├", "└", "│", "↓", "↳")) for line in lines):
+        return True
+    if "\n" in normalized_raw and (marker_count >= 1 or path_count >= 2):
+        return True
     if marker_count >= 2:
         return True
-    if "\n" in raw_text and (marker_count or text.count("/") >= 2):
+    if len(lines) > 1 and path_count >= 3:
         return True
     return False
 
@@ -298,7 +363,7 @@ def classify(paragraph, is_first_nonempty: bool) -> str:
         return toc
     if has_omml(paragraph):
         return "Equation"
-    if "code block" in style or "codeblock" in style or "代码" in style or "源码" in style:
+    if any(marker in style for marker in ("code block", "codeblock", "codepath", "代码", "源码")):
         return "Code Block"
     if "figure caption" in style or "图题" in style or re.match(r"^图\s*[0-9A-Za-z]", text):
         return "Figure Caption"
@@ -326,6 +391,9 @@ def classify(paragraph, is_first_nonempty: bool) -> str:
     if "heading 2" in style or "heading2" in style or "标题 2" in style:
         return "Heading 2"
     if "heading 3" in style or "heading3" in style or "标题 3" in style:
+        return "Heading 3"
+    if "heading 4" in style or "heading4" in style or "标题 4" in style:
+        # 本技能只定义三级标题；将源文档第四级标题纳入三级样式，避免降为正文。
         return "Heading 3"
     if "title" in style and is_first_nonempty:
         return "Title"
@@ -433,6 +501,40 @@ def strip_heading_prefix(paragraph, role: str) -> None:
         remaining -= remove_count
 
 
+def strip_paragraph_edge_whitespace(paragraph) -> None:
+    """移除非代码段落首尾的布局空白，不破坏字段和 OMML。"""
+    nodes = list(paragraph._p.iter())
+    leading = True
+    for node in nodes:
+        if node.tag == tag("t"):
+            value = node.text or ""
+            if leading:
+                value = value.lstrip(" \t\u00a0")
+                node.text = value or None
+                if value:
+                    leading = False
+        elif node.tag == tag("tab") and leading:
+            parent = node.getparent()
+            if parent is not None:
+                parent.remove(node)
+
+    trailing = True
+    for node in reversed(nodes):
+        if node.getparent() is None:
+            continue
+        if node.tag == tag("t"):
+            value = node.text or ""
+            if trailing:
+                value = value.rstrip(" \t\u00a0")
+                node.text = value or None
+                if value:
+                    trailing = False
+        elif node.tag == tag("tab") and trailing:
+            parent = node.getparent()
+            if parent is not None:
+                parent.remove(node)
+
+
 def clean_paragraph_properties(paragraph, style_name: str, style_id: str) -> None:
     ppr = paragraph._p.get_or_add_pPr()
     for child in list(ppr):
@@ -471,6 +573,33 @@ def set_cell_width(cell, width_twips: int) -> None:
     tc_w.set(tag("type"), "dxa")
 
 
+def visual_text_width(text: str) -> float:
+    """按中英文混排的近似字面宽度计算表格列需求。"""
+    width = 0.0
+    for char in text:
+        if char.isspace():
+            width += 0.35
+        elif unicodedata.east_asian_width(char) in {"W", "F"}:
+            width += 1.0
+        else:
+            width += 0.55
+    return width
+
+
+def table_column_score(table, column_index: int) -> float:
+    values = []
+    for row in table.rows:
+        if column_index >= len(row.cells):
+            continue
+        values.extend(paragraph.text for paragraph in row.cells[column_index].paragraphs)
+    if not values:
+        return 1.0
+    line_width = max((visual_text_width(line) for value in values for line in value.splitlines()), default=1.0)
+    tokens = [token for value in values for token in re.split(r"[\s/\\,，;；:：]+", value) if token]
+    longest_token = max((visual_text_width(token) for token in tokens), default=1.0)
+    return max(1.0, min(60.0, line_width + longest_token * 0.35))
+
+
 def set_table_borders(table) -> None:
     tbl_pr = table._tbl.tblPr
     borders = find(tbl_pr, "tblBorders")
@@ -507,15 +636,8 @@ def set_table_widths(table, available_twips: int) -> None:
     columns = len(table.columns)
     if columns == 0:
         return
-    scores = []
-    for column_index in range(columns):
-        max_chars = 1
-        for row in table.rows:
-            if column_index < len(row.cells):
-                value = max((len(clean(p.text)) for p in row.cells[column_index].paragraphs), default=1)
-                max_chars = max(max_chars, min(value, 36))
-        scores.append(max_chars)
-    minimum = max(600, min(1000, available_twips // (columns * 2)))
+    scores = [table_column_score(table, index) for index in range(columns)]
+    minimum = max(720, min(1050, available_twips // (columns * 4)))
     remaining = max(0, available_twips - minimum * columns)
     total_score = sum(scores) or columns
     widths = [minimum + round(remaining * score / total_score) for score in scores]
@@ -561,6 +683,7 @@ def remove_fixed_row_heights(table) -> None:
         tr_pr = row._tr.find(tag("trPr"))
         if tr_pr is not None:
             remove_all(tr_pr, "trHeight")
+            remove_all(tr_pr, "cantSplit")
 
 
 def all_tables(document: Document) -> list:
@@ -586,6 +709,7 @@ def format_tables(document: Document) -> None:
         tbl_pr = table._tbl.tblPr
         for child_name in ("tblStyle", "tblLook", "tblInd", "tblCellSpacing", "tblpPr"):
             remove_all(tbl_pr, child_name)
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
         table.autofit = False
         set_table_widths(table, available)
         set_table_borders(table)
@@ -618,7 +742,7 @@ def format_document(input_path: Path, output_path: Path, profile: str) -> None:
         raise ValueError("输出文件必须与输入文件不同，原文档不会被覆盖")
     source = Document(str(input_path))
     resolved_profile = detect_profile(source) if profile == "auto" else profile
-    original_paragraphs = all_paragraphs(source)
+    original_paragraphs = meaningful_paragraphs(source)
     roles = classify_paragraphs(original_paragraphs, resolved_profile)
 
     if not BASE_TEMPLATE_PATH.is_file():
@@ -646,6 +770,8 @@ def format_document(input_path: Path, output_path: Path, profile: str) -> None:
         if role not in {style.name for style in document.styles}:
             role = "Normal"
         strip_heading_prefix(paragraph, role)
+        if role != "Code Block" and role not in {"Equation", "TOC 1", "TOC 2", "TOC 3", "Figure List", "Table List"}:
+            strip_paragraph_edge_whitespace(paragraph)
         style = document.styles[role]
         clean_paragraph_properties(paragraph, role, style.style_id)
         clean_run_properties(paragraph)

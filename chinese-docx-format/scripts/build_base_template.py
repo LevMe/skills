@@ -555,6 +555,15 @@ def set_setting_flag(document: Document, name: str, enabled: bool) -> None:
         settings.append(OxmlElement("w:" + name))
 
 
+def remove_special_section_references(section) -> None:
+    """只保留普通页眉页脚引用，避免奇偶页缺少页码。"""
+    sect_pr = section._sectPr
+    for name in ("headerReference", "footerReference"):
+        for reference in list(sect_pr.findall(tag(name))):
+            if reference.get(tag("type")) != "default":
+                sect_pr.remove(reference)
+
+
 def configure_document(document: Document, profile: str = "general") -> None:
     if profile not in {"general", "thesis"}:
         raise ValueError(f"不支持的文档模式：{profile}")
@@ -563,7 +572,8 @@ def configure_document(document: Document, profile: str = "general") -> None:
     normal_id = document.styles["Normal"].style_id
     header_id = document.styles["Header"].style_id
     footer_id = document.styles["Footer"].style_id
-    set_setting_flag(document, "evenAndOddHeaders", thesis)
+    # 本技能只生成一个统一页脚；没有配套的奇偶页脚时不能启用奇偶页模式。
+    set_setting_flag(document, "evenAndOddHeaders", False)
     remove_all(document.settings._element, "characterSpacingControl")
     for section in document.sections:
         section.page_width = Cm(21)
@@ -576,8 +586,6 @@ def configure_document(document: Document, profile: str = "general") -> None:
         section.footer_distance = Cm(1.75 if thesis else 1.0)
         sect_pr = section._sectPr
         remove_all(sect_pr, "titlePg")
-        if thesis:
-            sect_pr.append(OxmlElement("w:titlePg"))
         page_number = find(sect_pr, "pgNumType")
         if page_number is None:
             page_number = OxmlElement("w:pgNumType")
@@ -588,6 +596,7 @@ def configure_document(document: Document, profile: str = "general") -> None:
         clear_container(section.header, header_id)
         clear_container(section.first_page_header, header_id)
         clear_container(section.even_page_header, header_id)
+        remove_special_section_references(section)
 
     add_baseline_marker(document)
     properties = document.core_properties

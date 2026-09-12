@@ -16,7 +16,7 @@
 - 图题和表题使用五号楷体；图像优先使用行内对象；表格使用可见网格。
 - 图题、表题和图表目录条目使用 1.25 倍行距。
 - 公式使用原生可编辑 OMML，不使用 MathType OLE 或原始 LaTeX。
-- 自带只读结构审计脚本，检查 DOCX 结构和常见格式问题。
+- 自带只读结构审计脚本，检查 DOCX 结构、直接格式、技术段落、表格分页和页脚字段问题。
 
 ## 安装
 
@@ -53,7 +53,7 @@ macOS 或 Linux：
 
     python chinese-docx-format/scripts/format_chinese_docx.py 输入.docx --output 输出.docx --profile auto
 
-该脚本以空白基线模板承载迁移后的内容，清除源文档的标题样式、节属性和直接格式，重建标题编号，保留正文、表格、图片和 OMML。源文档已有 MathType/OLE 时不会静默删除或伪装转换，会在审计中标记。新文档使用 `assets/chinese-docx-base-template.docx`，输入和输出路径必须不同。
+该脚本以空白基线模板承载迁移后的内容，清除源文档的标题样式、节属性和直接格式，重建标题编号，保留正文、表格、图片和 OMML；多行 JSON、调用链和目录树会使用左对齐技术文本样式。源文档已有 MathType/OLE 时不会静默删除或伪装转换，会在审计中标记。新文档使用 `assets/chinese-docx-base-template.docx`，输入和输出路径必须不同。
 
 ## 结构审计
 
@@ -61,7 +61,7 @@ macOS 或 Linux：
 
     python chinese-docx-format/scripts/audit_chinese_docx.py 输入.docx --profile auto --require-baseline --json 审计报告.json
 
-审计脚本只读检查，不会自动修改输入文档，主要检查页面和节、样式、标题编号、条件模块、图表、OMML、引用、参考文献和元数据警告。
+审计脚本只读检查，不会自动修改输入文档，主要检查页面和节、样式继承、标题编号、直接格式、正文空白、技术段落、页脚 PAGE 字段、条件模块、图表、表格、OMML、引用、参考文献和元数据警告。
 
 ## 视觉验收
 
@@ -69,7 +69,7 @@ macOS 或 Linux：
 
     powershell -File chinese-docx-format/scripts/render_docx_windows.ps1 -InputPath 输入.docx -OutputDirectory 渲染目录
 
-脚本使用 Windows PowerShell 5.1 调用 Microsoft Word 原生导出 PDF，再用环境中的 Poppler 转为页面图片并逐页检查；论文模式会保留用户页眉文字并使用页眉距 1.5 cm、页脚距 1.75 cm的节属性；所有模式不启用前置罗马数字页码。LibreOffice 不是硬依赖。脚本会先检查 Word 是否能创建临时文档，失败时直接报告工作文件环境问题。没有可用 Word 渲染器时，只能交付结构检查结果，并明确标注“视觉验收未完成”。
+脚本使用 Windows PowerShell 5.1 调用 Microsoft Word 原生导出 PDF，再用环境中的 Poppler 转为页面图片并逐页检查；论文模式会保留用户页眉文字并使用页眉距 1.5 cm、页脚距 1.75 cm的节属性；所有模式使用统一普通页脚和一个 PAGE 字段，不启用未配套的首页或奇偶页脚，也不启用前置罗马数字页码。LibreOffice 不是硬依赖。脚本会先检查 Word 是否能创建临时文档，失败时直接报告工作文件环境问题。没有可用 Word 渲染器时，只能交付结构检查结果，并明确标注“视觉验收未完成”。PDF、PNG 和审计报告应写入临时目录，不应写入用户源目录。
 
 ## 文件说明
 
@@ -88,3 +88,5 @@ macOS 或 Linux：
 ## 适用边界
 
 本 skill 只处理 DOCX。用户提供的学校规范或新模板优先于本 skill；参考论文只用于补充未明确的版式细节，不会复制其中的个人信息、学校信息、正文或嵌入对象。
+
+本 skill 不依赖项目目录中的一次性内容生成器。处理已有文档时，用户源 DOCX 只读；中间脚本、JSON、PDF 和 PNG 统一放在系统临时目录，最终 DOCX 写入用户指定的新路径。
